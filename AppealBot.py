@@ -35,8 +35,8 @@ TEMPLATES = {
         "EN": "⚠️ **[{curr}] ({provider})** Colleagues, technical maintenance is undergoing on the bank's side, which may result in higher failure rates and lower conversion.\n🛑 **Please temporarily stop processing traffic for this currency.**\nWe will let you know once restored."
     },
     "resolve": {
-        "RU": "✅ **[{curr}] ({provider})** Коллеги, сервис работает в штатном режиме. Технические работы/просадка завершены.",
-        "EN": "✅ **[{curr}] ({provider})** Colleagues, the service is fully operational. Maintenance/degradation resolved."
+        "RU": "✅ **[{curr}] ({provider})** Коллеги, сервис работает в штатном режиме. Технические работы завершены.",
+        "EN": "✅ **[{curr}] ({provider})** Colleagues, the service is fully operational. Maintenance resolved."
     }
 }
 
