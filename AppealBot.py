@@ -263,10 +263,10 @@ async def cmd_add_chat(message: types.Message):
         }
         save_data(data)
 
-        tags_str = ", ".join(tags) if tags else "нет"
+        tags_str = ", ".join(escape_md(t) for t in tags) if tags else "нет"
         thread_info = f" (Ветка ID: {thread_id})" if thread_id else ""
         await message.answer(
-            f"✅ Чат `{chat_key}`{thread_info} (**{merchant_name}**) зарегистрирован!\n"
+            f"✅ Чат `{chat_key}`{thread_info} (**{escape_md(merchant_name)}**) зарегистрирован!\n"
             f"• Валюты: **{', '.join(currencies)}**\n"
             f"• Язык общения: **{lang}**\n"
             f"• Теги ответственных: **{tags_str}**",
@@ -371,7 +371,7 @@ async def cmd_del_chat(message: types.Message):
             name = data["chats"][chat_key].get("name", "Без названия")
             del data["chats"][chat_key]
             save_data(data)
-            await message.answer(f"🗑 Чат `{chat_key}` ({name}) успешно удален из базы.", parse_mode="Markdown")
+            await message.answer(f"🗑 Чат `{chat_key}` ({escape_md(name)}) успешно удален из базы.", parse_mode="Markdown")
         else:
             await message.answer(f"❌ Чат с ID `{chat_key}` не найден в базе.", parse_mode="Markdown")
     except Exception:
@@ -414,10 +414,13 @@ async def cmd_list_chats(message: types.Message):
     text = f"📋 **Зарегистрированные чаты (всего {len(chats)}):**\n\n"
     for cid, info in chats.items():
         tags = info.get("tags", [])
-        tags_str = f" | cc: {' '.join(tags)}" if tags else ""
-        text += f"• `{cid}` | **{info['name']}** | [{info.get('lang', 'RU')}] | Валюты: {', '.join(info['currencies'])}{tags_str}\n"
+        safe_tags = [escape_md(t) for t in tags]
+        tags_str = f" | cc: {' '.join(safe_tags)}" if safe_tags else ""
+        safe_name = escape_md(info['name'])
+        text += f"• `{cid}` | **{safe_name}** | [{info.get('lang', 'RU')}] | Валюты: {', '.join(info['currencies'])}{tags_str}\n"
 
-    await message.answer(text, parse_mode="Markdown")
+    for chunk_start in range(0, len(text), 3500):
+        await message.answer(text[chunk_start:chunk_start + 3500], parse_mode="Markdown")
 
 
 # ------------------- ДИАГНОСТИКА: ПРОВЕРИТЬ ДОСТУПНОСТЬ ЧАТОВ -------------------
@@ -448,17 +451,17 @@ async def cmd_check_chats(message: types.Message):
             member = await bot.get_chat_member(chat_id, bot.id)
             status = member.status
             if status in ("kicked", "left"):
-                fail_list.append(f"`{cid_str}` ({info.get('name','?')}) — бот статус: **{status}**")
+                fail_list.append(f"`{cid_str}` ({escape_md(info.get('name','?'))}) — бот статус: **{status}**")
             else:
                 can_send = getattr(member, "can_post_messages", True)
                 if status == "restricted" and not can_send:
-                    fail_list.append(f"`{cid_str}` ({info.get('name','?')}) — бот **restricted**, нет прав писать")
+                    fail_list.append(f"`{cid_str}` ({escape_md(info.get('name','?'))}) — бот **restricted**, нет прав писать")
                 else:
-                    ok_list.append(f"`{cid_str}` ({info.get('name','?')}) — ok ({status})")
+                    ok_list.append(f"`{cid_str}` ({escape_md(info.get('name','?'))}) — ok ({status})")
         except TelegramAPIError as e:
-            fail_list.append(f"`{cid_str}` ({info.get('name','?')}) — ошибка: `{e}`")
+            fail_list.append(f"`{cid_str}` ({escape_md(info.get('name','?'))}) — ошибка: `{e}`")
         except Exception as e:
-            fail_list.append(f"`{cid_str}` ({info.get('name','?')}) — ошибка: `{e}`")
+            fail_list.append(f"`{cid_str}` ({escape_md(info.get('name','?'))}) — ошибка: `{e}`")
 
         await asyncio.sleep(0.1)
 
@@ -519,7 +522,7 @@ async def process_provider(message: types.Message, state: FSMContext):
 
     kb = build_chats_selection_keyboard(target_chats, selected_chat_ids, action_type="alert")
     await message.answer(
-        f"Валюта: **{currency}** | Источник: **{provider}**.\nОтметьте чаты, в которые нужно отправить сообщение:",
+        f"Валюта: **{currency}** | Источник: **{escape_md(provider)}**.\nОтметьте чаты, в которые нужно отправить сообщение:",
         reply_markup=kb,
         parse_mode="Markdown"
     )
@@ -563,7 +566,7 @@ async def finish_chat_selection(callback: types.CallbackQuery, state: FSMContext
     ])
 
     await callback.message.edit_text(
-        f"Валюта: **{currency}** | Источник: **{provider}** (чатов: **{len(selected_chat_ids)}**).\nВыберите тип оповещения:",
+        f"Валюта: **{currency}** | Источник: **{escape_md(provider)}** (чатов: **{len(selected_chat_ids)}**).\nВыберите тип оповещения:",
         reply_markup=kb,
         parse_mode="Markdown"
     )
@@ -668,7 +671,7 @@ async def send_alert(target_msg: types.Message, currency: str, provider: str, ta
     })
     save_data(data)
 
-    report = f"✅ Оповещение по **{currency} ({provider})** отправлено в {len(sent_messages)} чат(ов)!"
+    report = f"✅ Оповещение по **{escape_md(currency)} ({escape_md(provider)})** отправлено в {len(sent_messages)} чат(ов)!"
     if failed:
         report += f"\n\n❌ **Не отправлено в {len(failed)} чат(ов):**\n" + "\n".join(failed)
 
@@ -816,10 +819,10 @@ async def finish_resolve_process(callback: types.CallbackQuery, state: FSMContex
 
     if remaining_messages:
         incident["messages"] = remaining_messages
-        status_msg = f"🟢 Восстановление по **{currency} ({provider})** зафиксировано в {resolved_count} чат(ах).\n⚠️ Осталось чатов в этой просадке: **{len(remaining_messages)}**."
+        status_msg = f"🟢 Восстановление по **{escape_md(currency)} ({escape_md(provider)})** зафиксировано в {resolved_count} чат(ах).\n⚠️ Осталось чатов в этой просадке: **{len(remaining_messages)}**."
     else:
         data["active_incidents"] = [x for x in data["active_incidents"] if x["id"] != inc_id]
-        status_msg = f"🟢 Просадка по **{currency} ({provider})** полностью закрыта!"
+        status_msg = f"🟢 Просадка по **{escape_md(currency)} ({escape_md(provider)})** полностью закрыта!"
 
     if failed:
         status_msg += f"\n\n❌ **Не удалось отправить восстановление в {len(failed)} чат(ов):**\n" + "\n".join(failed)
@@ -849,7 +852,7 @@ async def show_incidents(message: types.Message):
     text = "🔴 **Активные просадки в данный момент:**\n\n"
     for inc in active:
         msg_count = len(inc.get("messages", []))
-        text += f"• **{inc['currency']}** ({inc['provider']}) — активна в {msg_count} чат(ах)\n"
+        text += f"• **{escape_md(inc['currency'])}** ({escape_md(inc['provider'])}) — активна в {msg_count} чат(ах)\n"
 
     await message.answer(text, parse_mode="Markdown")
 
