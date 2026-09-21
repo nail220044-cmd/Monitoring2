@@ -78,6 +78,14 @@ def authorize_user(user_id: int):
         save_data(data)
 
 
+def parse_chat_id(raw_id: str):
+    """Разбирает ID вида '-10044442718018_1' на chat_id (-10044442718018) и thread_id (1)"""
+    if "_" in raw_id:
+        parts = raw_id.split("_")
+        return int(parts[0]), int(parts[1])
+    return int(raw_id), None
+
+
 # ------------------- ИНИЦИАЛИЗАЦИЯ -------------------
 bot = Bot(token=TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
@@ -146,7 +154,9 @@ async def clean_keyboard(message: types.Message):
 
 @dp.message(F.chat.type != "private")
 async def catch_chat_id(message: types.Message):
-    print(f"\n🎯 НАСТОЯЩИЙ ID ЧАТА '{message.chat.title}': {message.chat.id}\n")
+    thread_suffix = f"_{message.message_thread_id}" if message.message_thread_id else ""
+    full_id = f"{message.chat.id}{thread_suffix}"
+    print(f"\n🎯 НАСТОЯЩИЙ ID ЧАТА '{message.chat.title}': {full_id}\n")
 
 
 # ------------------- АВТОРИЗАЦИЯ -------------------
@@ -191,7 +201,8 @@ async def cmd_add_chat(message: types.Message):
         if len(raw_args) < 2:
             raise ValueError("Недостаточно аргументов")
 
-        chat_id = str(int(raw_args[0].strip()))
+        chat_key = raw_args[0].strip()
+        chat_id, thread_id = parse_chat_id(chat_key)
         currencies = [c.strip().upper() for c in raw_args[1].split(",")]
 
         lang = "RU"
@@ -212,7 +223,9 @@ async def cmd_add_chat(message: types.Message):
                 merchant_name = " ".join(rem_args)
 
         data = load_data()
-        data["chats"][chat_id] = {
+        data["chats"][chat_key] = {
+            "chat_id": chat_id,
+            "thread_id": thread_id,
             "name": merchant_name,
             "currencies": currencies,
             "lang": lang,
@@ -222,8 +235,9 @@ async def cmd_add_chat(message: types.Message):
         save_data(data)
 
         tags_str = ", ".join(tags) if tags else "нет"
+        thread_info = f" (Ветка ID: {thread_id})" if thread_id else ""
         await message.answer(
-            f"✅ Чат `{chat_id}` (**{merchant_name}**) зарегистрирован!\n"
+            f"✅ Чат `{chat_key}`{thread_info} (**{merchant_name}**) зарегистрирован!\n"
             f"• Валюты: **{', '.join(currencies)}**\n"
             f"• Язык общения: **{lang}**\n"
             f"• Теги ответственных: **{tags_str}**",
@@ -232,8 +246,8 @@ async def cmd_add_chat(message: types.Message):
     except Exception:
         await message.answer(
             "⚠️ **Ошибка формата.**\nИспользуйте: `/add_chat <chat_id> <валюты> <RU/EN> <Имя_мерча> [теги]`\n"
-            "*Пример без тегов:* `/add_chat -1005459446650 KGS RU PINCO`\n"
-            "*Пример с тегами:* `/add_chat -1005459446650 KGS RU PINCO @alex,@john`",
+            "*Обычный чат:* `/add_chat -1005459446650 KGS RU PINCO @alex`\n"
+            "*Чат с веткой:* `/add_chat -10044442718018_1 KGS RU PINCO @alex`",
             parse_mode="Markdown"
         )
 
@@ -246,13 +260,11 @@ async def cmd_bulk_add_chats(message: types.Message):
     raw_text = message.text.split(maxsplit=1)
     if len(raw_text) < 2:
         return await message.answer(
-            "⚠️ **Формат массового импорта (без разделителей):**\n\n"
-            "Отправьте команду `/bulk_add` и со следующей строки список чатов через пробел:\n\n"
+            "⚠️ **Формат массового импорта:**\n\n"
             "```text\n"
             "/bulk_add\n"
             "-1005459446650 KGS,UZS RU PINCO @alex\n"
-            "-1009876543210 EGP EN Mostbet @john,@kate\n"
-            "-1001122334455 ARS RU 1xbet\n"
+            "-10044442718018_1 EGP EN Mostbet @john\n"
             "```",
             parse_mode="Markdown"
         )
@@ -273,7 +285,8 @@ async def cmd_bulk_add_chats(message: types.Message):
             continue
 
         try:
-            chat_id = str(int(parts[0]))
+            chat_key = parts[0].strip()
+            chat_id, thread_id = parse_chat_id(chat_key)
             currencies = [c.strip().upper() for c in parts[1].split(",") if c.strip()]
 
             lang = "RU"
@@ -293,7 +306,9 @@ async def cmd_bulk_add_chats(message: types.Message):
                 else:
                     merchant_name = " ".join(rem_args)
 
-            data["chats"][chat_id] = {
+            data["chats"][chat_key] = {
+                "chat_id": chat_id,
+                "thread_id": thread_id,
                 "name": merchant_name,
                 "currencies": currencies,
                 "lang": lang,
@@ -320,16 +335,16 @@ async def cmd_del_chat(message: types.Message):
 
     try:
         raw_args = message.text.split()[1:]
-        chat_id = str(int(raw_args[0].strip()))
+        chat_key = raw_args[0].strip()
 
         data = load_data()
-        if chat_id in data["chats"]:
-            name = data["chats"][chat_id].get("name", "Без названия")
-            del data["chats"][chat_id]
+        if chat_key in data["chats"]:
+            name = data["chats"][chat_key].get("name", "Без названия")
+            del data["chats"][chat_key]
             save_data(data)
-            await message.answer(f"🗑 Чат `{chat_id}` ({name}) успешно удален из базы.", parse_mode="Markdown")
+            await message.answer(f"🗑 Чат `{chat_key}` ({name}) успешно удален из базы.", parse_mode="Markdown")
         else:
-            await message.answer(f"❌ Чат с ID `{chat_id}` не найден в базе.", parse_mode="Markdown")
+            await message.answer(f"❌ Чат с ID `{chat_key}` не найден в базе.", parse_mode="Markdown")
     except Exception:
         await message.answer("⚠️ Формат команды: `/del_chat <chat_id>`", parse_mode="Markdown")
 
@@ -432,7 +447,7 @@ async def process_provider(message: types.Message, state: FSMContext):
 
 @dp.callback_query(IncidentState.selecting_chats, F.data.startswith("togglechat_"))
 async def toggle_chat_selection(callback: types.CallbackQuery, state: FSMContext):
-    chat_id = str(callback.data.split("_")[1])
+    chat_id = str(callback.data.split("togglechat_")[1])
     user_data = await state.get_data()
 
     target_chats = user_data["target_chats"]
@@ -515,10 +530,17 @@ async def send_alert(target_msg: types.Message, currency: str, provider: str, ta
     sent_messages = []
     selected_chat_ids_str = [str(x) for x in selected_chat_ids]
 
-    for cid in selected_chat_ids_str:
-        info = target_chats.get(cid, {})
+    for cid_str in selected_chat_ids_str:
+        info = target_chats.get(cid_str, {})
         lang = info.get("lang", "RU")
         tags = info.get("tags", [])
+        
+        # Парсим ID чата и ветки
+        chat_id = info.get("chat_id")
+        thread_id = info.get("thread_id")
+        
+        if not chat_id:
+            chat_id, thread_id = parse_chat_id(cid_str)
 
         # 1. Формируем тело сообщения
         if custom_text:
@@ -526,15 +548,20 @@ async def send_alert(target_msg: types.Message, currency: str, provider: str, ta
         else:
             alert_text = TEMPLATES[template_key][lang].format(curr=currency, provider=provider)
 
-        # 2. Обязательно добавляем теги ответственных (cc:) к ЛЮБОМУ типу сообщения
+        # 2. Добавляем теги
         if tags:
             alert_text += f"\n\n📌 **cc:** {' '.join(tags)}"
 
         try:
-            msg = await bot.send_message(chat_id=int(cid), text=alert_text, parse_mode="Markdown")
-            sent_messages.append({"chat_id": str(cid), "message_id": msg.message_id, "lang": lang})
+            msg = await bot.send_message(
+                chat_id=chat_id,
+                message_thread_id=thread_id,
+                text=alert_text,
+                parse_mode="Markdown"
+            )
+            sent_messages.append({"chat_key": cid_str, "chat_id": chat_id, "thread_id": thread_id, "message_id": msg.message_id, "lang": lang})
         except Exception as e:
-            print(f"Ошибка отправки в {cid}: {e}")
+            print(f"Ошибка отправки в {cid_str}: {e}")
 
     incident_id = len(data["active_incidents"]) + 1
     data["active_incidents"].append({
@@ -588,7 +615,7 @@ async def resolve_incident_select_chats(callback: types.CallbackQuery, state: FS
 
     active_incident_chats = {}
     for msg_info in incident["messages"]:
-        cid_str = str(msg_info["chat_id"])
+        cid_str = str(msg_info.get("chat_key", msg_info["chat_id"]))
         if cid_str in data["chats"]:
             chat_meta = data["chats"][cid_str]
         else:
@@ -615,7 +642,7 @@ async def resolve_incident_select_chats(callback: types.CallbackQuery, state: FS
 
 @dp.callback_query(ResolveState.selecting_resolve_chats, F.data.startswith("toggleresolve_"))
 async def toggle_resolve_chat(callback: types.CallbackQuery, state: FSMContext):
-    chat_id = str(callback.data.split("_")[1])
+    chat_id = str(callback.data.split("toggleresolve_")[1])
     user_data = await state.get_data()
 
     resolve_target_chats = user_data["resolve_target_chats"]
@@ -654,11 +681,16 @@ async def finish_resolve_process(callback: types.CallbackQuery, state: FSMContex
     provider = incident["provider"]
 
     for item in incident["messages"]:
-        cid_str = str(item["chat_id"])
+        cid_str = str(item.get("chat_key", item["chat_id"]))
 
         if cid_str in selected_resolve_ids:
             lang = item.get("lang", "RU")
             tags = data.get("chats", {}).get(cid_str, {}).get("tags", [])
+
+            chat_id = item.get("chat_id")
+            thread_id = item.get("thread_id")
+            if not chat_id:
+                chat_id, thread_id = parse_chat_id(cid_str)
 
             resolve_text = TEMPLATES["resolve"][lang].format(curr=currency, provider=provider)
             if tags:
@@ -666,7 +698,8 @@ async def finish_resolve_process(callback: types.CallbackQuery, state: FSMContex
 
             try:
                 await bot.send_message(
-                    chat_id=int(cid_str),
+                    chat_id=chat_id,
+                    message_thread_id=thread_id,
                     text=resolve_text,
                     reply_to_message_id=item["message_id"],
                     parse_mode="Markdown"
@@ -675,7 +708,12 @@ async def finish_resolve_process(callback: types.CallbackQuery, state: FSMContex
             except Exception as e:
                 print(f"Не удалось ответить ответом в чат {cid_str}: {e}")
                 try:
-                    await bot.send_message(chat_id=int(cid_str), text=resolve_text, parse_mode="Markdown")
+                    await bot.send_message(
+                        chat_id=chat_id,
+                        message_thread_id=thread_id,
+                        text=resolve_text,
+                        parse_mode="Markdown"
+                    )
                     resolved_count += 1
                 except Exception as ex:
                     print(f"Сбой отправки в {cid_str}: {ex}")
