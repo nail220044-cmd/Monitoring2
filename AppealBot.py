@@ -9,6 +9,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeybo
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.exceptions import TelegramRetryAfter, TelegramAPIError
 
 # ------------------- ЗАГРУЗКА ПЕРЕМЕННЫХ ОКРУЖЕНИЯ -------------------
 load_dotenv()
@@ -83,6 +84,18 @@ def parse_chat_id(raw_id: str):
         parts = raw_id.split("_")
         return int(parts[0]), int(parts[1])
     return int(raw_id), None
+
+
+# ------------------- ЛОГ ОШИБОК В ФАЙЛ (раз на ботхосте нет консоли) -------------------
+LOG_FILE = "errors.log"
+
+
+def log_error(text: str):
+    try:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(text + "\n")
+    except Exception:
+        pass
 
 
 # ------------------- ИНИЦИАЛИЗАЦИЯ -------------------
@@ -264,4 +277,570 @@ async def cmd_bulk_add_chats(message: types.Message):
             "/bulk_add\n"
             "-1005459446650 KGS,UZS RU PINCO @alex\n"
             "-10044442718018_1 EGP EN Mostbet @john\n"
-            "
+            "```",
+            parse_mode="Markdown"
+        )
+
+    lines = raw_text[1].strip().split("\n")
+    data = load_data()
+    added_count = 0
+    errors = []
+
+    for idx, line in enumerate(lines, start=1):
+        line = line.strip()
+        if not line:
+            continue
+
+        parts = line.split()
+        if len(parts) < 2:
+            errors.append(f"Строка {idx}: недостаточно данных")
+            continue
+
+        try:
+            chat_key = parts[0].strip()
+            chat_id, thread_id = parse_chat_id(chat_key)
+            currencies = [c.strip().upper() for c in parts[1].split(",") if c.strip()]
+
+            lang = "RU"
+            rem_args = parts[2:]
+
+            if rem_args and rem_args[0].upper() in ["RU", "EN"]:
+                lang = rem_args[0].upper()
+                rem_args = rem_args[1:]
+
+            tags = []
+            merchant_name = "Без названия"
+
+            if rem_args:
+                if "@" in rem_args[-1]:
+                    tags = [t.strip() for t in rem_args[-1].split(",") if t.strip().startswith("@")]
+                    merchant_name = " ".join(rem_args[:-1]) if len(rem_args) > 1 else merchant_name
+                else:
+                    merchant_name = " ".join(rem_args)
+
+            data["chats"][chat_key] = {
+                "chat_id": chat_id,
+                "thread_id": thread_id,
+                "name": merchant_name,
+                "currencies": currencies,
+                "lang": lang,
+                "tags": tags,
+                "is_active": True
+            }
+            added_count += 1
+        except Exception:
+            errors.append(f"Строка {idx}: ошибка формата ID (`{parts[0]}`)")
+
+    save_data(data)
+
+    report = f"🎉 **Успешно заведено чатов: {added_count}**\n"
+    if errors:
+        report += "\n⚠️ **Ошибки в строках:**\n" + "\n".join(errors)
+
+    await message.answer(report, parse_mode="Markdown")
+
+
+@dp.message(Command("del_chat"), F.chat.type == "private")
+async def cmd_del_chat(message: types.Message):
+    if not is_authorized(message.from_user.id):
+        return await message.answer("🛑 Введите пароль через /start")
+
+    try:
+        raw_args = message.text.split()[1:]
+        chat_key = raw_args[0].strip()
+
+        data = load_data()
+        if chat_key in data["chats"]:
+            name = data["chats"][chat_key].get("name", "Без названия")
+            del data["chats"][chat_key]
+            save_data(data)
+            await message.answer(f"🗑 Чат `{chat_key}` ({name}) успешно удален из базы.", parse_mode="Markdown")
+        else:
+            await message.answer(f"❌ Чат с ID `{chat_key}` не найден в базе.", parse_mode="Markdown")
+    except Exception:
+        await message.answer("⚠️ Формат команды: `/del_chat <chat_id>`", parse_mode="Markdown")
+
+
+@dp.message(Command("clear_all_chats"), F.chat.type == "private")
+async def cmd_clear_all_chats(message: types.Message):
+    if not is_authorized(message.from_user.id):
+        return await message.answer("🛑 Введите пароль через /start")
+
+    args = message.text.split()[1:]
+    if not args or args[0] != "confirm":
+        return await message.answer(
+            "⚠️ **ВНИМАНИЕ! Эта команда полностью удалит ВСЕ чаты из базы!**\n\n"
+            "Чтобы подтвердить полное удаление, отправьте:\n"
+            "`/clear_all_chats confirm`",
+            parse_mode="Markdown"
+        )
+
+    data = load_data()
+    count = len(data.get("chats", {}))
+    data["chats"] = {}
+    save_data(data)
+
+    await message.answer(f"💥 **База полностью очищена!** Удалено чатов: **{count}**.", parse_mode="Markdown")
+
+
+@dp.message(Command("list_chats"), F.chat.type == "private")
+async def cmd_list_chats(message: types.Message):
+    if not is_authorized(message.from_user.id):
+        return await message.answer("🛑 Введите пароль через /start")
+
+    data = load_data()
+    chats = data.get("chats", {})
+
+    if not chats:
+        return await message.answer("📋 Список зарегистрированных чатов пуст.")
+
+    text = f"📋 **Зарегистрированные чаты (всего {len(chats)}):**\n\n"
+    for cid, info in chats.items():
+        tags = info.get("tags", [])
+        tags_str = f" | cc: {' '.join(tags)}" if tags else ""
+        text += f"• `{cid}` | **{info['name']}** | [{info.get('lang', 'RU')}] | Валюты: {', '.join(info['currencies'])}{tags_str}\n"
+
+    await message.answer(text, parse_mode="Markdown")
+
+
+# ------------------- ДИАГНОСТИКА: ПРОВЕРИТЬ ДОСТУПНОСТЬ ЧАТОВ -------------------
+@dp.message(Command("check_chats"), F.chat.type == "private")
+async def cmd_check_chats(message: types.Message):
+    """Проходит по всем зарегистрированным чатам и проверяет, может ли бот туда писать."""
+    if not is_authorized(message.from_user.id):
+        return await message.answer("🛑 Введите пароль через /start")
+
+    data = load_data()
+    chats = data.get("chats", {})
+
+    if not chats:
+        return await message.answer("📋 Список зарегистрированных чатов пуст.")
+
+    await message.answer(f"🔎 Проверяю {len(chats)} чат(ов), это может занять время...")
+
+    ok_list = []
+    fail_list = []
+
+    for cid_str, info in chats.items():
+        chat_id = info.get("chat_id")
+        thread_id = info.get("thread_id")
+        if not chat_id:
+            chat_id, thread_id = parse_chat_id(cid_str)
+
+        try:
+            member = await bot.get_chat_member(chat_id, bot.id)
+            status = member.status
+            if status in ("kicked", "left"):
+                fail_list.append(f"`{cid_str}` ({info.get('name','?')}) — бот статус: **{status}**")
+            else:
+                can_send = getattr(member, "can_post_messages", True)
+                if status == "restricted" and not can_send:
+                    fail_list.append(f"`{cid_str}` ({info.get('name','?')}) — бот **restricted**, нет прав писать")
+                else:
+                    ok_list.append(f"`{cid_str}` ({info.get('name','?')}) — ok ({status})")
+        except TelegramAPIError as e:
+            fail_list.append(f"`{cid_str}` ({info.get('name','?')}) — ошибка: `{e}`")
+        except Exception as e:
+            fail_list.append(f"`{cid_str}` ({info.get('name','?')}) — ошибка: `{e}`")
+
+        await asyncio.sleep(0.1)
+
+    report = f"✅ **Доступны:** {len(ok_list)}\n❌ **Проблемные:** {len(fail_list)}\n\n"
+    if fail_list:
+        report += "**Проблемные чаты:**\n" + "\n".join(fail_list)
+
+    # Разбивка на части, если отчёт слишком длинный для одного сообщения
+    for chunk_start in range(0, len(report), 3500):
+        await message.answer(report[chunk_start:chunk_start + 3500], parse_mode="Markdown")
+
+
+# ------------------- ХЕНДЛЕР 1: ОПОВЕСТИТЬ О ПРОСАДКЕ -------------------
+@dp.message(F.text == "🚨 Оповестить о просадке", F.chat.type == "private")
+async def start_incident(message: types.Message, state: FSMContext):
+    if not is_authorized(message.from_user.id):
+        return await message.answer("🛑 Введите пароль через /start")
+
+    await state.set_state(IncidentState.waiting_for_currency)
+    await message.answer("Выберите валюту, по которой возникла просадка:", reply_markup=currencies_keyboard())
+
+
+@dp.callback_query(IncidentState.waiting_for_currency, F.data.startswith("curr_"))
+async def process_currency(callback: types.CallbackQuery, state: FSMContext):
+    currency = callback.data.split("_")[1]
+    data = load_data()
+
+    target_chats = {str(cid): info for cid, info in data["chats"].items() if currency in info["currencies"]}
+
+    if not target_chats:
+        await state.clear()
+        return await callback.message.edit_text(f"❌ Нет чатов, привязанных к валюте **{currency}**.",
+                                                parse_mode="Markdown")
+
+    await state.update_data(selected_currency=currency, target_chats=target_chats)
+    await state.set_state(IncidentState.waiting_for_provider)
+
+    await callback.message.edit_text(
+        f"Валюта: **{currency}**.\nУкажите банк / провайдера (например: *Kapitalbank* или *P2P Gateway*):",
+        parse_mode="Markdown"
+    )
+
+
+@dp.message(IncidentState.waiting_for_provider, F.chat.type == "private")
+async def process_provider(message: types.Message, state: FSMContext):
+    provider = message.text.strip()
+    user_data = await state.get_data()
+
+    target_chats = user_data["target_chats"]
+    currency = user_data["selected_currency"]
+    selected_chat_ids = [str(cid) for cid in target_chats.keys()]
+
+    await state.update_data(
+        provider=provider,
+        selected_chat_ids=selected_chat_ids
+    )
+    await state.set_state(IncidentState.selecting_chats)
+
+    kb = build_chats_selection_keyboard(target_chats, selected_chat_ids, action_type="alert")
+    await message.answer(
+        f"Валюта: **{currency}** | Источник: **{provider}**.\nОтметьте чаты, в которые нужно отправить сообщение:",
+        reply_markup=kb,
+        parse_mode="Markdown"
+    )
+
+
+@dp.callback_query(IncidentState.selecting_chats, F.data.startswith("togglechat_"))
+async def toggle_chat_selection(callback: types.CallbackQuery, state: FSMContext):
+    chat_id = str(callback.data.split("togglechat_")[1])
+    user_data = await state.get_data()
+
+    target_chats = user_data["target_chats"]
+    selected_chat_ids = [str(x) for x in user_data["selected_chat_ids"]]
+
+    if chat_id in selected_chat_ids:
+        selected_chat_ids.remove(chat_id)
+    else:
+        selected_chat_ids.append(chat_id)
+
+    await state.update_data(selected_chat_ids=selected_chat_ids)
+
+    kb = build_chats_selection_keyboard(target_chats, selected_chat_ids, action_type="alert")
+    await callback.message.edit_reply_markup(reply_markup=kb)
+
+
+@dp.callback_query(IncidentState.selecting_chats, F.data == "chats_done")
+async def finish_chat_selection(callback: types.CallbackQuery, state: FSMContext):
+    user_data = await state.get_data()
+    selected_chat_ids = user_data["selected_chat_ids"]
+    currency = user_data["selected_currency"]
+    provider = user_data["provider"]
+
+    if not selected_chat_ids:
+        return await callback.answer("⚠️ Выберите хотя бы один чат!", show_alert=True)
+
+    await state.set_state(IncidentState.waiting_for_type)
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⚠️ Стандарт (Работы на стороне банка)", callback_data="type_std")],
+        [InlineKeyboardButton(text="🛑 Стандарт + СТОП трафик", callback_data="type_stop")],
+        [InlineKeyboardButton(text="✏️ Ввести свой текст", callback_data="type_custom")]
+    ])
+
+    await callback.message.edit_text(
+        f"Валюта: **{currency}** | Источник: **{provider}** (чатов: **{len(selected_chat_ids)}**).\nВыберите тип оповещения:",
+        reply_markup=kb,
+        parse_mode="Markdown"
+    )
+
+
+@dp.callback_query(IncidentState.waiting_for_type, F.data.startswith("type_"))
+async def process_type(callback: types.CallbackQuery, state: FSMContext):
+    msg_type = callback.data.split("_")[1]
+
+    if msg_type == "custom":
+        await state.set_state(IncidentState.waiting_for_custom_text)
+        await callback.message.edit_text("Введите ваш произвольный текст сообщения (он будет отправлен 1 в 1):")
+        return
+
+    user_data = await state.get_data()
+    await send_alert(
+        target_msg=callback.message,
+        currency=user_data["selected_currency"],
+        provider=user_data["provider"],
+        target_chats=user_data["target_chats"],
+        selected_chat_ids=user_data["selected_chat_ids"],
+        template_key=msg_type
+    )
+    await state.clear()
+
+
+@dp.message(IncidentState.waiting_for_custom_text, F.chat.type == "private")
+async def process_custom_text(message: types.Message, state: FSMContext):
+    user_data = await state.get_data()
+    await send_alert(
+        target_msg=message,
+        currency=user_data["selected_currency"],
+        provider=user_data["provider"],
+        target_chats=user_data["target_chats"],
+        selected_chat_ids=user_data["selected_chat_ids"],
+        custom_text=message.text
+    )
+    await state.clear()
+
+
+async def safe_send(chat_id, thread_id, text, reply_to_message_id=None, retries=2):
+    """Отправка с ретраем на TelegramRetryAfter (flood control)."""
+    attempt = 0
+    while True:
+        try:
+            return await bot.send_message(
+                chat_id=chat_id,
+                message_thread_id=thread_id,
+                text=text,
+                reply_to_message_id=reply_to_message_id,
+                parse_mode="Markdown"
+            )
+        except TelegramRetryAfter as e:
+            attempt += 1
+            if attempt > retries:
+                raise
+            await asyncio.sleep(e.retry_after + 0.5)
+
+
+async def send_alert(target_msg: types.Message, currency: str, provider: str, target_chats: dict, selected_chat_ids: list,
+                     template_key: str = None, custom_text: str = None):
+    data = load_data()
+    sent_messages = []
+    failed = []
+    selected_chat_ids_str = [str(x) for x in selected_chat_ids]
+
+    for cid_str in selected_chat_ids_str:
+        info = target_chats.get(cid_str, {})
+        lang = info.get("lang", "RU")
+        tags = info.get("tags", [])
+        name = info.get("name", cid_str)
+
+        chat_id = info.get("chat_id")
+        thread_id = info.get("thread_id")
+
+        if not chat_id:
+            chat_id, thread_id = parse_chat_id(cid_str)
+
+        if custom_text:
+            alert_text = custom_text
+        else:
+            alert_text = TEMPLATES[template_key][lang].format(curr=currency, provider=provider)
+
+        if tags:
+            alert_text += f"\n\n📌 **cc:** {' '.join(tags)}"
+
+        try:
+            msg = await safe_send(chat_id, thread_id, alert_text)
+            sent_messages.append({"chat_key": cid_str, "chat_id": chat_id, "thread_id": thread_id, "message_id": msg.message_id, "lang": lang})
+        except Exception as e:
+            err_str = str(e)
+            log_error(f"[send_alert] {cid_str} ({name}): {err_str}")
+            failed.append(f"• `{cid_str}` ({name}): {err_str}")
+
+    incident_id = len(data["active_incidents"]) + 1
+    data["active_incidents"].append({
+        "id": incident_id,
+        "currency": currency,
+        "provider": provider,
+        "messages": sent_messages
+    })
+    save_data(data)
+
+    report = f"✅ Оповещение по **{currency} ({provider})** отправлено в {len(sent_messages)} чат(ов)!"
+    if failed:
+        report += f"\n\n❌ **Не отправлено в {len(failed)} чат(ов):**\n" + "\n".join(failed)
+
+    for chunk_start in range(0, len(report), 3500):
+        await target_msg.answer(report[chunk_start:chunk_start + 3500], parse_mode="Markdown")
+
+
+# ------------------- ХЕНДЛЕР 2: ВОССТАНОВЛЕНИЕ С ВЫБОРОМ ИНЦИДЕНТА -------------------
+@dp.message(F.text == "✅ Зафиксировать восстановление", F.chat.type == "private")
+async def resolve_incident_start(message: types.Message):
+    if not is_authorized(message.from_user.id):
+        return await message.answer("🛑 Введите пароль через /start")
+
+    data = load_data()
+    active = data.get("active_incidents", [])
+
+    if not active:
+        return await message.answer("🟢 На данный момент нет активных просадок.")
+
+    buttons = []
+    for inc in active:
+        inc_id = inc["id"]
+        curr = inc["currency"]
+        prov = inc["provider"]
+        chat_count = len(inc.get("messages", []))
+        btn_text = f"{curr} — {prov} ({chat_count} чат)"
+        buttons.append([InlineKeyboardButton(text=btn_text, callback_data=f"resolveinc_{inc_id}")])
+
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+    await message.answer("Выберите конкретную просадку для восстановления:", reply_markup=kb)
+
+
+@dp.callback_query(F.data.startswith("resolveinc_"))
+async def resolve_incident_select_chats(callback: types.CallbackQuery, state: FSMContext):
+    inc_id = int(callback.data.split("_")[1])
+    data = load_data()
+
+    incident = next((x for x in data.get("active_incidents", []) if x["id"] == inc_id), None)
+
+    if not incident or not incident.get("messages"):
+        return await callback.message.edit_text("❌ Ошибка: Инцидент не найден или уже закрыт.")
+
+    active_incident_chats = {}
+    for msg_info in incident["messages"]:
+        cid_str = str(msg_info.get("chat_key", msg_info["chat_id"]))
+        if cid_str in data["chats"]:
+            chat_meta = data["chats"][cid_str]
+        else:
+            chat_meta = {"name": f"Чат {cid_str}", "lang": msg_info.get("lang", "RU")}
+
+        active_incident_chats[cid_str] = chat_meta
+
+    selected_resolve_ids = [str(x) for x in active_incident_chats.keys()]
+
+    await state.update_data(
+        resolve_inc_id=inc_id,
+        resolve_target_chats=active_incident_chats,
+        selected_resolve_ids=selected_resolve_ids
+    )
+    await state.set_state(ResolveState.selecting_resolve_chats)
+
+    kb = build_chats_selection_keyboard(active_incident_chats, selected_resolve_ids, action_type="resolve")
+    await callback.message.edit_text(
+        f"Восстановление: **{incident['currency']}** (**{incident['provider']}**).\nОтметьте чаты, в которых нужно зафиксировать восстановление:",
+        reply_markup=kb,
+        parse_mode="Markdown"
+    )
+
+
+@dp.callback_query(ResolveState.selecting_resolve_chats, F.data.startswith("toggleresolve_"))
+async def toggle_resolve_chat(callback: types.CallbackQuery, state: FSMContext):
+    chat_id = str(callback.data.split("toggleresolve_")[1])
+    user_data = await state.get_data()
+
+    resolve_target_chats = user_data["resolve_target_chats"]
+    selected_resolve_ids = [str(x) for x in user_data["selected_resolve_ids"]]
+
+    if chat_id in selected_resolve_ids:
+        selected_resolve_ids.remove(chat_id)
+    else:
+        selected_resolve_ids.append(chat_id)
+
+    await state.update_data(selected_resolve_ids=selected_resolve_ids)
+
+    kb = build_chats_selection_keyboard(resolve_target_chats, selected_resolve_ids, action_type="resolve")
+    await callback.message.edit_reply_markup(reply_markup=kb)
+
+
+@dp.callback_query(ResolveState.selecting_resolve_chats, F.data == "finish_resolve_done")
+async def finish_resolve_process(callback: types.CallbackQuery, state: FSMContext):
+    user_data = await state.get_data()
+    inc_id = user_data["resolve_inc_id"]
+    selected_resolve_ids = [str(x) for x in user_data["selected_resolve_ids"]]
+
+    if not selected_resolve_ids:
+        return await callback.answer("⚠️ Выберите хотя бы один чат для восстановления!", show_alert=True)
+
+    data = load_data()
+    incident = next((x for x in data.get("active_incidents", []) if x["id"] == inc_id), None)
+
+    if not incident or not incident.get("messages"):
+        await state.clear()
+        return await callback.message.edit_text("❌ Ошибка: Инцидент уже закрыт.")
+
+    resolved_count = 0
+    failed = []
+    remaining_messages = []
+    currency = incident["currency"]
+    provider = incident["provider"]
+
+    for item in incident["messages"]:
+        cid_str = str(item.get("chat_key", item["chat_id"]))
+
+        if cid_str in selected_resolve_ids:
+            lang = item.get("lang", "RU")
+            name = data.get("chats", {}).get(cid_str, {}).get("name", cid_str)
+            tags = data.get("chats", {}).get(cid_str, {}).get("tags", [])
+
+            chat_id = item.get("chat_id")
+            thread_id = item.get("thread_id")
+            if not chat_id:
+                chat_id, thread_id = parse_chat_id(cid_str)
+
+            resolve_text = TEMPLATES["resolve"][lang].format(curr=currency, provider=provider)
+            if tags:
+                resolve_text += f"\n\n📌 **cc:** {' '.join(tags)}"
+
+            try:
+                await safe_send(chat_id, thread_id, resolve_text, reply_to_message_id=item["message_id"])
+                resolved_count += 1
+            except Exception as e:
+                log_error(f"[resolve reply] {cid_str} ({name}): {e}")
+                try:
+                    await safe_send(chat_id, thread_id, resolve_text)
+                    resolved_count += 1
+                except Exception as ex:
+                    log_error(f"[resolve plain] {cid_str} ({name}): {ex}")
+                    failed.append(f"• `{cid_str}` ({name}): {ex}")
+                    # чат не восстановлен - оставляем его в активном инциденте
+                    remaining_messages.append(item)
+                    continue
+        else:
+            remaining_messages.append(item)
+
+    if remaining_messages:
+        incident["messages"] = remaining_messages
+        status_msg = f"🟢 Восстановление по **{currency} ({provider})** зафиксировано в {resolved_count} чат(ах).\n⚠️ Осталось чатов в этой просадке: **{len(remaining_messages)}**."
+    else:
+        data["active_incidents"] = [x for x in data["active_incidents"] if x["id"] != inc_id]
+        status_msg = f"🟢 Просадка по **{currency} ({provider})** полностью закрыта!"
+
+    if failed:
+        status_msg += f"\n\n❌ **Не удалось отправить восстановление в {len(failed)} чат(ов):**\n" + "\n".join(failed)
+
+    save_data(data)
+    await state.clear()
+
+    for chunk_start in range(0, len(status_msg), 3500):
+        if chunk_start == 0:
+            await callback.message.edit_text(status_msg[:3500], parse_mode="Markdown")
+        else:
+            await callback.message.answer(status_msg[chunk_start:chunk_start + 3500], parse_mode="Markdown")
+
+
+# ------------------- ХЕНДЛЕР 3: ПОКАЗАТЬ ИМЕЮЩИЕСЯ ПРОСАДКИ -------------------
+@dp.message(F.text == "📊 Показать имеющиеся просадки", F.chat.type == "private")
+async def show_incidents(message: types.Message):
+    if not is_authorized(message.from_user.id):
+        return await message.answer("🛑 Введите пароль через /start")
+
+    data = load_data()
+    active = data.get("active_incidents", [])
+
+    if not active:
+        return await message.answer("🟢 **Все системы работают штатно.** Активных просадок нет.", parse_mode="Markdown")
+
+    text = "🔴 **Активные просадки в данный момент:**\n\n"
+    for inc in active:
+        msg_count = len(inc.get("messages", []))
+        text += f"• **{inc['currency']}** ({inc['provider']}) — активна в {msg_count} чат(ах)\n"
+
+    await message.answer(text, parse_mode="Markdown")
+
+
+# ------------------- ЗАПУСК -------------------
+async def main():
+    await bot.delete_webhook(drop_pending_updates=True)
+    print("Старые обновления сброшены. Бот готов к работе!")
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
