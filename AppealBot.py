@@ -21,7 +21,14 @@ if not TOKEN or not SECRET_PASSWORD:
     print("❌ ОШИБКА: Переменные BOT_TOKEN или SECRET_PASSWORD не найдены в файле .env!")
     sys.exit(1)
 
-DATA_FILE = "data.json"
+# Персистентная папка на ботхосте (сохраняется между пересборками контейнера)
+DATA_DIR = os.getenv("DATA_DIR", "/app/data")
+try:
+    os.makedirs(DATA_DIR, exist_ok=True)
+except Exception:
+    DATA_DIR = "."  # локальный запуск / нет прав на /app/data - сохраняем рядом со скриптом
+
+DATA_FILE = os.path.join(DATA_DIR, "data.json")
 CURRENCIES = ["EGP", "ARS", "UZS", "AUD", "AZN", "KGS", "MNT"]
 
 # ------------------- СЛОВАРЬ ШАБЛОНОВ (RU / EN) -------------------
@@ -78,6 +85,16 @@ def authorize_user(user_id: int):
         save_data(data)
 
 
+def escape_md(text: str) -> str:
+    """Экранирует спецсимволы legacy Markdown (_, *, `, [), чтобы они не ломали парсинг
+    (например подчёркивания в тегах вида @team_24h_monitoring)."""
+    if not text:
+        return text
+    for ch in ("\\", "_", "*", "`", "["):
+        text = text.replace(ch, "\\" + ch)
+    return text
+
+
 def parse_chat_id(raw_id: str):
     """Разбирает ID вида '-10044442718018_1' на chat_id (-10044442718018) и thread_id (1)"""
     if "_" in raw_id:
@@ -87,7 +104,7 @@ def parse_chat_id(raw_id: str):
 
 
 # ------------------- ЛОГ ОШИБОК В ФАЙЛ (раз на ботхосте нет консоли) -------------------
-LOG_FILE = "errors.log"
+LOG_FILE = os.path.join(DATA_DIR, "errors.log")
 
 
 def log_error(text: str):
@@ -626,12 +643,13 @@ async def send_alert(target_msg: types.Message, currency: str, provider: str, ta
             chat_id, thread_id = parse_chat_id(cid_str)
 
         if custom_text:
-            alert_text = custom_text
+            alert_text = escape_md(custom_text)
         else:
-            alert_text = TEMPLATES[template_key][lang].format(curr=currency, provider=provider)
+            alert_text = TEMPLATES[template_key][lang].format(curr=escape_md(currency), provider=escape_md(provider))
 
         if tags:
-            alert_text += f"\n\n📌 **cc:** {' '.join(tags)}"
+            safe_tags = [escape_md(t) for t in tags]
+            alert_text += f"\n\n📌 **cc:** {' '.join(safe_tags)}"
 
         try:
             msg = await safe_send(chat_id, thread_id, alert_text)
@@ -639,7 +657,7 @@ async def send_alert(target_msg: types.Message, currency: str, provider: str, ta
         except Exception as e:
             err_str = str(e)
             log_error(f"[send_alert] {cid_str} ({name}): {err_str}")
-            failed.append(f"• `{cid_str}` ({name}): {err_str}")
+            failed.append(f"• `{cid_str}` ({escape_md(name)}): {escape_md(err_str)}")
 
     incident_id = len(data["active_incidents"]) + 1
     data["active_incidents"].append({
@@ -774,9 +792,10 @@ async def finish_resolve_process(callback: types.CallbackQuery, state: FSMContex
             if not chat_id:
                 chat_id, thread_id = parse_chat_id(cid_str)
 
-            resolve_text = TEMPLATES["resolve"][lang].format(curr=currency, provider=provider)
+            resolve_text = TEMPLATES["resolve"][lang].format(curr=escape_md(currency), provider=escape_md(provider))
             if tags:
-                resolve_text += f"\n\n📌 **cc:** {' '.join(tags)}"
+                safe_tags = [escape_md(t) for t in tags]
+                resolve_text += f"\n\n📌 **cc:** {' '.join(safe_tags)}"
 
             try:
                 await safe_send(chat_id, thread_id, resolve_text, reply_to_message_id=item["message_id"])
@@ -788,7 +807,7 @@ async def finish_resolve_process(callback: types.CallbackQuery, state: FSMContex
                     resolved_count += 1
                 except Exception as ex:
                     log_error(f"[resolve plain] {cid_str} ({name}): {ex}")
-                    failed.append(f"• `{cid_str}` ({name}): {ex}")
+                    failed.append(f"• `{cid_str}` ({escape_md(name)}): {escape_md(str(ex))}")
                     # чат не восстановлен - оставляем его в активном инциденте
                     remaining_messages.append(item)
                     continue
