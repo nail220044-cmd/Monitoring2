@@ -129,7 +129,8 @@ class IncidentState(StatesGroup):
     waiting_for_provider = State()
     selecting_chats = State()
     waiting_for_type = State()
-    waiting_for_custom_text = State()
+    waiting_for_custom_text_ru = State()
+    waiting_for_custom_text_en = State()
 
 
 class ResolveState(StatesGroup):
@@ -577,8 +578,11 @@ async def process_type(callback: types.CallbackQuery, state: FSMContext):
     msg_type = callback.data.split("_")[1]
 
     if msg_type == "custom":
-        await state.set_state(IncidentState.waiting_for_custom_text)
-        await callback.message.edit_text("Введите ваш произвольный текст сообщения (он будет отправлен 1 в 1):")
+        await state.set_state(IncidentState.waiting_for_custom_text_ru)
+        await callback.message.edit_text(
+            "✏️ Введите текст на **русском** (уйдёт в чаты с языком RU, отправляется 1 в 1):",
+            parse_mode="Markdown"
+        )
         return
 
     user_data = await state.get_data()
@@ -593,8 +597,37 @@ async def process_type(callback: types.CallbackQuery, state: FSMContext):
     await state.clear()
 
 
-@dp.message(IncidentState.waiting_for_custom_text, F.chat.type == "private")
-async def process_custom_text(message: types.Message, state: FSMContext):
+@dp.message(IncidentState.waiting_for_custom_text_ru, F.chat.type == "private")
+async def process_custom_text_ru(message: types.Message, state: FSMContext):
+    await state.update_data(custom_text_ru=message.text)
+    user_data = await state.get_data()
+
+    target_chats = user_data["target_chats"]
+    selected_chat_ids = [str(x) for x in user_data["selected_chat_ids"]]
+    has_en_chat = any(target_chats.get(cid, {}).get("lang", "RU") == "EN" for cid in selected_chat_ids)
+
+    if not has_en_chat:
+        # среди выбранных чатов нет ни одного EN — не отвлекаем вторым вопросом
+        await send_alert(
+            target_msg=message,
+            currency=user_data["selected_currency"],
+            provider=user_data["provider"],
+            target_chats=target_chats,
+            selected_chat_ids=selected_chat_ids,
+            custom_texts={"RU": message.text, "EN": message.text}
+        )
+        await state.clear()
+        return
+
+    await state.set_state(IncidentState.waiting_for_custom_text_en)
+    await message.answer(
+        "✏️ Теперь введите текст на **английском** (уйдёт в чаты с языком EN, отправляется 1 в 1):",
+        parse_mode="Markdown"
+    )
+
+
+@dp.message(IncidentState.waiting_for_custom_text_en, F.chat.type == "private")
+async def process_custom_text_en(message: types.Message, state: FSMContext):
     user_data = await state.get_data()
     await send_alert(
         target_msg=message,
@@ -602,7 +635,7 @@ async def process_custom_text(message: types.Message, state: FSMContext):
         provider=user_data["provider"],
         target_chats=user_data["target_chats"],
         selected_chat_ids=user_data["selected_chat_ids"],
-        custom_text=message.text
+        custom_texts={"RU": user_data["custom_text_ru"], "EN": message.text}
     )
     await state.clear()
 
@@ -627,7 +660,7 @@ async def safe_send(chat_id, thread_id, text, reply_to_message_id=None, retries=
 
 
 async def send_alert(target_msg: types.Message, currency: str, provider: str, target_chats: dict, selected_chat_ids: list,
-                     template_key: str = None, custom_text: str = None):
+                     template_key: str = None, custom_texts: dict = None):
     data = load_data()
     sent_messages = []
     failed = []
@@ -645,8 +678,10 @@ async def send_alert(target_msg: types.Message, currency: str, provider: str, ta
         if not chat_id:
             chat_id, thread_id = parse_chat_id(cid_str)
 
-        if custom_text:
-            alert_text = escape_md(custom_text)
+        if custom_texts:
+            # берём версию под язык конкретного чата; если её нет - используем RU как запасной вариант
+            raw_text = custom_texts.get(lang, custom_texts.get("RU", ""))
+            alert_text = escape_md(raw_text)
         else:
             alert_text = TEMPLATES[template_key][lang].format(curr=escape_md(currency), provider=escape_md(provider))
 
