@@ -475,6 +475,64 @@ async def cmd_check_chats(message: types.Message):
         await message.answer(report[chunk_start:chunk_start + 3500], parse_mode="Markdown")
 
 
+# ------------------- ПРИНУДИТЕЛЬНОЕ ЗАКРЫТИЕ ЗАВИСШЕГО ЧАТА В ИНЦИДЕНТЕ -------------------
+@dp.message(Command("force_resolve"), F.chat.type == "private")
+async def cmd_force_resolve(message: types.Message):
+    """Убирает конкретный чат из активного инцидента без попытки реально отправить сообщение -
+    для случаев, когда чат навсегда недоступен (бота кикнули, ветка не восстановится)."""
+    if not is_authorized(message.from_user.id):
+        return await message.answer("🛑 Введите пароль через /start")
+
+    args = message.text.split()[1:]
+    if len(args) < 2:
+        return await message.answer(
+            "⚠️ Формат: `/force_resolve <inc_id> <chat_id>`\n"
+            "Узнать inc_id и chat_id можно из сообщения «📊 Показать имеющиеся просадки» "
+            "или из отчёта об ошибке отправки (там chat_id уже указан).",
+            parse_mode="Markdown"
+        )
+
+    try:
+        inc_id = int(args[0])
+    except ValueError:
+        return await message.answer("⚠️ inc_id должен быть числом.")
+
+    target_cid = args[1].strip()
+
+    data = load_data()
+    incident = next((x for x in data.get("active_incidents", []) if x["id"] == inc_id), None)
+
+    if not incident:
+        return await message.answer(f"❌ Инцидент с id `{inc_id}` не найден (возможно, уже закрыт).", parse_mode="Markdown")
+
+    before_count = len(incident.get("messages", []))
+    incident["messages"] = [
+        m for m in incident.get("messages", [])
+        if str(m.get("chat_key", m.get("chat_id"))) != target_cid
+    ]
+    after_count = len(incident["messages"])
+
+    if before_count == after_count:
+        return await message.answer(
+            f"❌ Чат `{target_cid}` не найден в инциденте `{inc_id}` (уже закрыт или ID указан неверно).",
+            parse_mode="Markdown"
+        )
+
+    if not incident["messages"]:
+        data["active_incidents"] = [x for x in data["active_incidents"] if x["id"] != inc_id]
+        save_data(data)
+        await message.answer(
+            f"✅ Чат `{target_cid}` принудительно закрыт.\n🟢 Это был последний чат — просадка **{escape_md(incident['currency'])} ({escape_md(incident['provider'])})** полностью закрыта.",
+            parse_mode="Markdown"
+        )
+    else:
+        save_data(data)
+        await message.answer(
+            f"✅ Чат `{target_cid}` принудительно закрыт (реальное сообщение о восстановлении НЕ отправлялось).\n⚠️ Осталось чатов в просадке: **{len(incident['messages'])}**.",
+            parse_mode="Markdown"
+        )
+
+
 # ------------------- ХЕНДЛЕР 1: ОПОВЕСТИТЬ О ПРОСАДКЕ -------------------
 @dp.message(F.text == "🚨 Оповестить о просадке", F.chat.type == "private")
 async def start_incident(message: types.Message, state: FSMContext):
@@ -659,11 +717,27 @@ async def safe_send(chat_id, thread_id, text, reply_to_message_id=None, retries=
             await asyncio.sleep(e.retry_after + 0.5)
 
 
+async def send_with_thread_fallback(chat_id, thread_id, text, reply_to_message_id=None):
+    """Отправляет сообщение; если Telegram отвечает "ветка не найдена" (топик удалён/закрыт),
+    автоматически повторяет без привязки к ветке - сообщение уйдёт в General.
+    Возвращает (msg, использованный_thread_id, произошёл_ли_fallback)."""
+    try:
+        msg = await safe_send(chat_id, thread_id, text, reply_to_message_id=reply_to_message_id)
+        return msg, thread_id, False
+    except Exception as e:
+        thread_missing = thread_id is not None and "thread" in str(e).lower()
+        if not thread_missing:
+            raise
+        msg = await safe_send(chat_id, None, text, reply_to_message_id=reply_to_message_id)
+        return msg, None, True
+
+
 async def send_alert(target_msg: types.Message, currency: str, provider: str, target_chats: dict, selected_chat_ids: list,
                      template_key: str = None, custom_texts: dict = None):
     data = load_data()
     sent_messages = []
     failed = []
+    warnings = []
     selected_chat_ids_str = [str(x) for x in selected_chat_ids]
 
     for cid_str in selected_chat_ids_str:
@@ -689,13 +763,19 @@ async def send_alert(target_msg: types.Message, currency: str, provider: str, ta
             safe_tags = [escape_md(t) for t in tags]
             alert_text += f"\n\n📌 **cc:** {' '.join(safe_tags)}"
 
+        fell_back_note = ""
         try:
-            msg = await safe_send(chat_id, thread_id, alert_text)
-            sent_messages.append({"chat_key": cid_str, "chat_id": chat_id, "thread_id": thread_id, "message_id": msg.message_id, "lang": lang})
+            msg, used_thread_id, fell_back = await send_with_thread_fallback(chat_id, thread_id, alert_text)
+            if fell_back:
+                fell_back_note = "ветка недоступна, сообщение ушло в General"
+            sent_messages.append({"chat_key": cid_str, "chat_id": chat_id, "thread_id": used_thread_id, "message_id": msg.message_id, "lang": lang})
         except Exception as e:
             err_str = str(e)
             log_error(f"[send_alert] {cid_str} ({name}): {err_str}")
             failed.append(f"• `{cid_str}` ({escape_md(name)}): {escape_md(err_str)}")
+            continue
+        if fell_back_note:
+            warnings.append(f"• `{cid_str}` ({escape_md(name)}): {escape_md(fell_back_note)}")
 
     incident_id = len(data["active_incidents"]) + 1
     data["active_incidents"].append({
@@ -707,6 +787,8 @@ async def send_alert(target_msg: types.Message, currency: str, provider: str, ta
     save_data(data)
 
     report = f"✅ Оповещение по **{escape_md(currency)} ({escape_md(provider)})** отправлено в {len(sent_messages)} чат(ов)!"
+    if warnings:
+        report += f"\n\n⚠️ **Автоматически перенаправлено в General ({len(warnings)}):**\n" + "\n".join(warnings)
     if failed:
         report += f"\n\n❌ **Не отправлено в {len(failed)} чат(ов):**\n" + "\n".join(failed)
 
@@ -813,6 +895,7 @@ async def finish_resolve_process(callback: types.CallbackQuery, state: FSMContex
 
     resolved_count = 0
     failed = []
+    warnings = []
     remaining_messages = []
     currency = incident["currency"]
     provider = incident["provider"]
@@ -836,13 +919,17 @@ async def finish_resolve_process(callback: types.CallbackQuery, state: FSMContex
                 resolve_text += f"\n\n📌 **cc:** {' '.join(safe_tags)}"
 
             try:
-                await safe_send(chat_id, thread_id, resolve_text, reply_to_message_id=item["message_id"])
+                _, _, fell_back = await send_with_thread_fallback(chat_id, thread_id, resolve_text, reply_to_message_id=item["message_id"])
                 resolved_count += 1
+                if fell_back:
+                    warnings.append(f"• `{cid_str}` ({escape_md(name)}): ветка недоступна, ушло в General")
             except Exception as e:
                 log_error(f"[resolve reply] {cid_str} ({name}): {e}")
                 try:
-                    await safe_send(chat_id, thread_id, resolve_text)
+                    _, _, fell_back = await send_with_thread_fallback(chat_id, thread_id, resolve_text)
                     resolved_count += 1
+                    if fell_back:
+                        warnings.append(f"• `{cid_str}` ({escape_md(name)}): ветка недоступна, ушло в General")
                 except Exception as ex:
                     log_error(f"[resolve plain] {cid_str} ({name}): {ex}")
                     failed.append(f"• `{cid_str}` ({escape_md(name)}): {escape_md(str(ex))}")
@@ -861,6 +948,8 @@ async def finish_resolve_process(callback: types.CallbackQuery, state: FSMContex
 
     if failed:
         status_msg += f"\n\n❌ **Не удалось отправить восстановление в {len(failed)} чат(ов):**\n" + "\n".join(failed)
+    if warnings:
+        status_msg += f"\n\n⚠️ **Автоматически перенаправлено в General ({len(warnings)}):**\n" + "\n".join(warnings)
 
     save_data(data)
     await state.clear()
