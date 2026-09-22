@@ -976,7 +976,7 @@ async def show_incidents(message: types.Message):
     text = "🔴 **Активные просадки в данный момент:**\n\n"
     for inc in active:
         msg_count = len(inc.get("messages", []))
-        text += f"• **{escape_md(inc['currency'])}** ({escape_md(inc['provider'])}) — активна в {msg_count} чат(ах)\n"
+        text += f"• `id {inc['id']}` **{escape_md(inc['currency'])}** ({escape_md(inc['provider'])}) — активна в {msg_count} чат(ах)\n"
 
     await message.answer(text, parse_mode="Markdown")
 
