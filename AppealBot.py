@@ -138,6 +138,17 @@ class ResolveState(StatesGroup):
 
 
 # ------------------- КЛАВИАТУРЫ -------------------
+MENU_BUTTON_TEXTS = {
+    "🚨 Оповестить о просадке",
+    "✅ Зафиксировать восстановление",
+    "📊 Показать имеющиеся просадки",
+}
+
+
+def is_menu_button(text: str) -> bool:
+    return (text or "").strip() in MENU_BUTTON_TEXTS
+
+
 def main_keyboard():
     kb = [
         [KeyboardButton(text="🚨 Оповестить о просадке")],
@@ -533,6 +544,63 @@ async def cmd_force_resolve(message: types.Message):
         )
 
 
+# ------------------- УДАЛЕНИЕ ОШИБОЧНО ОТПРАВЛЕННОГО ОПОВЕЩЕНИЯ ВО ВСЕХ ЧАТАХ -------------------
+@dp.message(Command("delete_alert"), F.chat.type == "private")
+async def cmd_delete_alert(message: types.Message):
+    """Удаляет сообщения инцидента из всех чатов, куда они были отправлены (по chat_id + message_id,
+    сохранённым при рассылке). Полезно для отзыва ошибочно отправленного оповещения.
+    Ограничение Telegram: удалить можно только сообщение младше 48 часов и там, где у бота есть права."""
+    if not is_authorized(message.from_user.id):
+        return await message.answer("🛑 Введите пароль через /start")
+
+    args = message.text.split()[1:]
+    if not args:
+        return await message.answer(
+            "⚠️ Формат: `/delete_alert <inc_id>`\n"
+            "inc_id возьми из «📊 Показать имеющиеся просадки».\n"
+            "⚠️ Удалит сообщение ВО ВСЕХ чатах этого инцидента без возможности отмены.",
+            parse_mode="Markdown"
+        )
+
+    try:
+        inc_id = int(args[0])
+    except ValueError:
+        return await message.answer("⚠️ inc_id должен быть числом.")
+
+    data = load_data()
+    incident = next((x for x in data.get("active_incidents", []) if x["id"] == inc_id), None)
+
+    if not incident:
+        return await message.answer(f"❌ Инцидент с id `{inc_id}` не найден.", parse_mode="Markdown")
+
+    deleted = []
+    failed = []
+
+    for item in incident.get("messages", []):
+        cid_str = str(item.get("chat_key", item.get("chat_id")))
+        chat_id = item.get("chat_id")
+        message_id = item.get("message_id")
+        name = data.get("chats", {}).get(cid_str, {}).get("name", cid_str)
+
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=message_id)
+            deleted.append(f"• `{cid_str}` ({escape_md(name)})")
+        except Exception as e:
+            log_error(f"[delete_alert] {cid_str} ({name}): {e}")
+            failed.append(f"• `{cid_str}` ({escape_md(name)}): {escape_md(str(e))}")
+
+    # инцидент закрываем полностью - сообщения либо удалены, либо их всё равно больше не восстановить штатно
+    data["active_incidents"] = [x for x in data["active_incidents"] if x["id"] != inc_id]
+    save_data(data)
+
+    report = f"🗑 Удаление сообщений инцидента `{inc_id}` завершено.\n\n✅ **Удалено ({len(deleted)}):**\n" + ("\n".join(deleted) if deleted else "—")
+    if failed:
+        report += f"\n\n❌ **Не удалось удалить ({len(failed)}) - удали вручную в самом чате:**\n" + "\n".join(failed)
+
+    for chunk_start in range(0, len(report), 3500):
+        await message.answer(report[chunk_start:chunk_start + 3500], parse_mode="Markdown")
+
+
 # ------------------- ХЕНДЛЕР 1: ОПОВЕСТИТЬ О ПРОСАДКЕ -------------------
 @dp.message(F.text == "🚨 Оповестить о просадке", F.chat.type == "private")
 async def start_incident(message: types.Message, state: FSMContext):
@@ -566,6 +634,10 @@ async def process_currency(callback: types.CallbackQuery, state: FSMContext):
 
 @dp.message(IncidentState.waiting_for_provider, F.chat.type == "private")
 async def process_provider(message: types.Message, state: FSMContext):
+    if is_menu_button(message.text):
+        await state.clear()
+        return await message.answer("⚠️ Действие отменено (нажата кнопка меню вместо текста). Начните заново.", reply_markup=main_keyboard())
+
     provider = message.text.strip()
     user_data = await state.get_data()
 
@@ -657,6 +729,10 @@ async def process_type(callback: types.CallbackQuery, state: FSMContext):
 
 @dp.message(IncidentState.waiting_for_custom_text_ru, F.chat.type == "private")
 async def process_custom_text_ru(message: types.Message, state: FSMContext):
+    if is_menu_button(message.text):
+        await state.clear()
+        return await message.answer("⚠️ Действие отменено (нажата кнопка меню вместо текста). Начните заново.", reply_markup=main_keyboard())
+
     await state.update_data(custom_text_ru=message.text)
     user_data = await state.get_data()
 
@@ -686,6 +762,10 @@ async def process_custom_text_ru(message: types.Message, state: FSMContext):
 
 @dp.message(IncidentState.waiting_for_custom_text_en, F.chat.type == "private")
 async def process_custom_text_en(message: types.Message, state: FSMContext):
+    if is_menu_button(message.text):
+        await state.clear()
+        return await message.answer("⚠️ Действие отменено (нажата кнопка меню вместо текста). Начните заново.", reply_markup=main_keyboard())
+
     user_data = await state.get_data()
     await send_alert(
         target_msg=message,
@@ -978,7 +1058,41 @@ async def show_incidents(message: types.Message):
         msg_count = len(inc.get("messages", []))
         text += f"• `id {inc['id']}` **{escape_md(inc['currency'])}** ({escape_md(inc['provider'])}) — активна в {msg_count} чат(ах)\n"
 
-    await message.answer(text, parse_mode="Markdown")
+    buttons = [
+        [InlineKeyboardButton(
+            text=f"🗑 Удалить id {inc['id']} ({inc['currency']} · {inc['provider']}) без уведомления",
+            callback_data=f"silentremove_{inc['id']}"
+        )]
+        for inc in active
+    ]
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+
+    await message.answer(text, reply_markup=kb, parse_mode="Markdown")
+
+
+@dp.callback_query(F.data.startswith("silentremove_"))
+async def silent_remove_incident(callback: types.CallbackQuery):
+    """Убирает инцидент целиком из active_incidents БЕЗ отправки сообщения о восстановлении -
+    для случаев, когда мерчантов уже оповестили по другому каналу, но фиксировать это в боте не нужно."""
+    if not is_authorized(callback.from_user.id):
+        return await callback.answer("🛑 Нет доступа", show_alert=True)
+
+    inc_id = int(callback.data.split("_")[1])
+    data = load_data()
+    incident = next((x for x in data.get("active_incidents", []) if x["id"] == inc_id), None)
+
+    if not incident:
+        return await callback.answer("Уже закрыт или не найден", show_alert=True)
+
+    data["active_incidents"] = [x for x in data["active_incidents"] if x["id"] != inc_id]
+    save_data(data)
+
+    await callback.answer("Удалено без уведомления чатов")
+    await callback.message.edit_text(
+        f"🗑 Просадка **{escape_md(incident['currency'])} ({escape_md(incident['provider'])})** удалена из списка активных.\n"
+        f"Сообщения о восстановлении никуда не отправлялись.",
+        parse_mode="Markdown"
+    )
 
 
 # ------------------- ЗАПУСК -------------------
