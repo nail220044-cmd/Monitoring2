@@ -51,13 +51,13 @@ TEMPLATES = {
 # ------------------- ХРАНИЛИЩЕ ДАННЫХ (JSON) -------------------
 def load_data():
     if not os.path.exists(DATA_FILE):
-        return {"chats": {}, "active_incidents": [], "authorized_users": []}
+        return {"chats": {}, "active_incidents": [], "authorized_users": [], "next_incident_id": 1}
 
     with open(DATA_FILE, "r", encoding="utf-8") as f:
         try:
             data = json.load(f)
         except Exception:
-            data = {"chats": {}, "active_incidents": [], "authorized_users": []}
+            data = {"chats": {}, "active_incidents": [], "authorized_users": [], "next_incident_id": 1}
 
         if "authorized_users" not in data:
             data["authorized_users"] = []
@@ -65,6 +65,11 @@ def load_data():
             data["chats"] = {}
         if "active_incidents" not in data or isinstance(data["active_incidents"], dict):
             data["active_incidents"] = []
+        if "next_incident_id" not in data:
+            # миграция со старой схемы (id = len(active_incidents)+1): берём максимум уже
+            # выданных id среди активных инцидентов + 1, чтобы не выдать повторный номер
+            existing_ids = [inc.get("id", 0) for inc in data["active_incidents"]]
+            data["next_incident_id"] = (max(existing_ids) + 1) if existing_ids else 1
         return data
 
 
@@ -149,6 +154,14 @@ def is_menu_button(text: str) -> bool:
     return (text or "").strip() in MENU_BUTTON_TEXTS
 
 
+def is_reserved_input(text: str) -> bool:
+    """Считает 'зарезервированным' любой текст, который не должен восприниматься как ввод -
+    кнопки меню и любые команды (начинаются с /). Нужно, чтобы завис<ший диалог не проглатывал
+    команды вроде /force_resolve, воспринимая их как обычный текст."""
+    t = (text or "").strip()
+    return t in MENU_BUTTON_TEXTS or t.startswith("/")
+
+
 def main_keyboard():
     kb = [
         [KeyboardButton(text="🚨 Оповестить о просадке")],
@@ -158,8 +171,13 @@ def main_keyboard():
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True, selective=True)
 
 
+def cancel_button_row():
+    return [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_flow")]
+
+
 def currencies_keyboard():
     buttons = [[InlineKeyboardButton(text=curr, callback_data=f"curr_{curr}")] for curr in CURRENCIES]
+    buttons.append(cancel_button_row())
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
@@ -179,7 +197,31 @@ def build_chats_selection_keyboard(target_chats: dict, selected_chat_ids: list, 
     done_callback = "chats_done" if action_type == "alert" else "finish_resolve_done"
 
     buttons.append([InlineKeyboardButton(text=done_btn_text, callback_data=done_callback)])
+    buttons.append(cancel_button_row())
     return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def cancel_only_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[cancel_button_row()])
+
+
+@dp.callback_query(F.data == "cancel_flow")
+async def cancel_flow(callback: types.CallbackQuery, state: FSMContext):
+    """Универсальная отмена - работает на любом шаге сценария оповещения/восстановления."""
+    await state.clear()
+    await callback.answer("Отменено")
+    try:
+        await callback.message.edit_text("❌ Действие отменено.")
+    except Exception:
+        pass
+    await callback.message.answer("Главное меню:", reply_markup=main_keyboard())
+
+
+@dp.message(Command("cancel"), F.chat.type == "private")
+async def cmd_cancel(message: types.Message, state: FSMContext):
+    """Текстовый аналог кнопки отмены - на случай, если инлайн-кнопки не видно (старое сообщение и т.п.)."""
+    await state.clear()
+    await message.answer("❌ Действие отменено.", reply_markup=main_keyboard())
 
 
 # ------------------- БЕСШУМНАЯ ОЧИСТКА КЛАВИАТУРЫ -------------------
@@ -628,15 +670,20 @@ async def process_currency(callback: types.CallbackQuery, state: FSMContext):
 
     await callback.message.edit_text(
         f"Валюта: **{currency}**.\nУкажите банк / провайдера (например: *Kapitalbank* или *P2P Gateway*):",
-        parse_mode="Markdown"
+        parse_mode="Markdown",
+        reply_markup=cancel_only_keyboard()
     )
 
 
 @dp.message(IncidentState.waiting_for_provider, F.chat.type == "private")
 async def process_provider(message: types.Message, state: FSMContext):
-    if is_menu_button(message.text):
+    if is_reserved_input(message.text):
         await state.clear()
-        return await message.answer("⚠️ Действие отменено (нажата кнопка меню вместо текста). Начните заново.", reply_markup=main_keyboard())
+        return await message.answer(
+            "⚠️ Действие отменено (получена кнопка меню или команда вместо текста).\n"
+            "Если это была команда - отправьте её ещё раз, теперь она сработает.",
+            reply_markup=main_keyboard()
+        )
 
     provider = message.text.strip()
     user_data = await state.get_data()
@@ -693,7 +740,8 @@ async def finish_chat_selection(callback: types.CallbackQuery, state: FSMContext
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="⚠️ Стандарт (Работы на стороне банка)", callback_data="type_std")],
         [InlineKeyboardButton(text="🛑 Стандарт + СТОП трафик", callback_data="type_stop")],
-        [InlineKeyboardButton(text="✏️ Ввести свой текст", callback_data="type_custom")]
+        [InlineKeyboardButton(text="✏️ Ввести свой текст", callback_data="type_custom")],
+        cancel_button_row()
     ])
 
     await callback.message.edit_text(
@@ -711,7 +759,8 @@ async def process_type(callback: types.CallbackQuery, state: FSMContext):
         await state.set_state(IncidentState.waiting_for_custom_text_ru)
         await callback.message.edit_text(
             "✏️ Введите текст на **русском** (уйдёт в чаты с языком RU, отправляется 1 в 1):",
-            parse_mode="Markdown"
+            parse_mode="Markdown",
+            reply_markup=cancel_only_keyboard()
         )
         return
 
@@ -729,9 +778,13 @@ async def process_type(callback: types.CallbackQuery, state: FSMContext):
 
 @dp.message(IncidentState.waiting_for_custom_text_ru, F.chat.type == "private")
 async def process_custom_text_ru(message: types.Message, state: FSMContext):
-    if is_menu_button(message.text):
+    if is_reserved_input(message.text):
         await state.clear()
-        return await message.answer("⚠️ Действие отменено (нажата кнопка меню вместо текста). Начните заново.", reply_markup=main_keyboard())
+        return await message.answer(
+            "⚠️ Действие отменено (получена кнопка меню или команда вместо текста).\n"
+            "Если это была команда - отправьте её ещё раз, теперь она сработает.",
+            reply_markup=main_keyboard()
+        )
 
     await state.update_data(custom_text_ru=message.text)
     user_data = await state.get_data()
@@ -756,15 +809,20 @@ async def process_custom_text_ru(message: types.Message, state: FSMContext):
     await state.set_state(IncidentState.waiting_for_custom_text_en)
     await message.answer(
         "✏️ Теперь введите текст на **английском** (уйдёт в чаты с языком EN, отправляется 1 в 1):",
-        parse_mode="Markdown"
+        parse_mode="Markdown",
+        reply_markup=cancel_only_keyboard()
     )
 
 
 @dp.message(IncidentState.waiting_for_custom_text_en, F.chat.type == "private")
 async def process_custom_text_en(message: types.Message, state: FSMContext):
-    if is_menu_button(message.text):
+    if is_reserved_input(message.text):
         await state.clear()
-        return await message.answer("⚠️ Действие отменено (нажата кнопка меню вместо текста). Начните заново.", reply_markup=main_keyboard())
+        return await message.answer(
+            "⚠️ Действие отменено (получена кнопка меню или команда вместо текста).\n"
+            "Если это была команда - отправьте её ещё раз, теперь она сработает.",
+            reply_markup=main_keyboard()
+        )
 
     user_data = await state.get_data()
     await send_alert(
@@ -857,7 +915,8 @@ async def send_alert(target_msg: types.Message, currency: str, provider: str, ta
         if fell_back_note:
             warnings.append(f"• `{cid_str}` ({escape_md(name)}): {escape_md(fell_back_note)}")
 
-    incident_id = len(data["active_incidents"]) + 1
+    incident_id = data.get("next_incident_id", 1)
+    data["next_incident_id"] = incident_id + 1
     data["active_incidents"].append({
         "id": incident_id,
         "currency": currency,
@@ -897,7 +956,7 @@ async def resolve_incident_start(message: types.Message):
         btn_text = f"{curr} — {prov} ({chat_count} чат)"
         buttons.append([InlineKeyboardButton(text=btn_text, callback_data=f"resolveinc_{inc_id}")])
 
-    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons + [cancel_button_row()])
     await message.answer("Выберите конкретную просадку для восстановления:", reply_markup=kb)
 
 
