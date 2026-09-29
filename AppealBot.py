@@ -18,7 +18,7 @@ TOKEN = os.getenv("BOT_TOKEN")
 SECRET_PASSWORD = os.getenv("SECRET_PASSWORD")
 
 if not TOKEN or not SECRET_PASSWORD:
-    print("❌ ОШИБКА: Переменные BOT_TOKEN или SECRET_PASSWORD не найдены в файле .env!")
+    print("❌ ОШИБКА: Переменные BOT_TOKEN или SECRET_PASSWORD не найдены в файле ..env!")
     sys.exit(1)
 
 # Персистентная папка на ботхосте (сохраняется между пересборками контейнера)
@@ -34,17 +34,32 @@ CURRENCIES = ["EGP", "ARS", "UZS", "AUD", "AZN", "KGS", "MNT"]
 # ------------------- СЛОВАРЬ ШАБЛОНОВ (RU / EN) -------------------
 TEMPLATES = {
     "std": {
-        "RU": "⚠️ **[{curr}] ({provider})** Коллеги, на стороне банка наблюдаются технические трудности, из-за чего могут происходить отмены и задержки платежей. На нашей стороне всё работает штатно, трафик приостанавливать не требуется. Мы сообщим вам о восстановлении.",
-        "EN": "⚠️ **[{curr}] ({provider})** Colleagues, technical issues are currently observed on the bank's side, which may cause failed transactions and delays. Systems on our side are operating normally; traffic does not need to be stopped. We'll let you know once restored."
+        "RU": "⚠️ **[{curr}]{provider_part}** Коллеги, на стороне банка наблюдаются технические трудности, из-за чего могут происходить отмены и задержки платежей. На нашей стороне всё работает штатно, трафик приостанавливать не требуется. Мы сообщим вам о восстановлении.",
+        "EN": "⚠️ **[{curr}]{provider_part}** Colleagues, technical issues are currently observed on the bank's side, which may cause failed transactions and delays. Systems on our side are operating normally; traffic does not need to be stopped. We'll let you know once restored."
     },
     "stop": {
-        "RU": "⚠️ **[{curr}] ({provider})** Коллеги, на стороне банка ведутся технические работы, в связи с чем могут быть отмены и снижение конверсии.\n🛑 **Просим временно остановить трафик по данной валюте.**\nМы сообщим вам о восстановлении.",
-        "EN": "⚠️ **[{curr}] ({provider})** Colleagues, technical maintenance is undergoing on the bank's side, which may result in higher failure rates and lower conversion.\n🛑 **Please temporarily stop processing traffic for this currency.**\nWe will let you know once restored."
+        "RU": "⚠️ **[{curr}]{provider_part}** Коллеги, на стороне банка ведутся технические работы, в связи с чем могут быть отмены и снижение конверсии.\n🛑 **Просим временно остановить трафик по данной валюте.**\nМы сообщим вам о восстановлении.",
+        "EN": "⚠️ **[{curr}]{provider_part}** Colleagues, technical maintenance is undergoing on the bank's side, which may result in higher failure rates and lower conversion.\n🛑 **Please temporarily stop processing traffic for this currency.**\nWe will let you know once restored."
+    },
+    "short_std": {
+        "RU": "⚠️ **[{curr}]** Коллеги, в данный момент наблюдаются временные технические трудности, из-за чего возможны отмены и задержки платежей. Трафик приостанавливать не требуется. О восстановлении сообщим дополнительно.",
+        "EN": "⚠️ **[{curr}]** Colleagues, we are currently experiencing temporary technical issues, which may cause failed transactions and delays. Traffic does not need to be paused. We will notify you once resolved."
+    },
+    "short_stop": {
+        "RU": "⚠️ **[{curr}]** Коллеги, в данный момент наблюдаются временные технические трудности, в связи с чем возможны отмены платежей и снижение конверсии.\n🛑 **Просим временно приостановить трафик по данной валюте.**\nО восстановлении сообщим дополнительно.",
+        "EN": "⚠️ **[{curr}]** Colleagues, we are currently experiencing temporary technical issues, which may result in failed transactions and lower conversion.\n🛑 **Please temporarily pause traffic for this currency.**\nWe will notify you once resolved."
     },
     "resolve": {
-        "RU": "✅ **[{curr}] ({provider})** Коллеги, сервис работает в штатном режиме. Технические работы завершены.",
-        "EN": "✅ **[{curr}] ({provider})** Colleagues, the service is fully operational. Maintenance resolved."
+        "RU": "✅ **[{curr}]{provider_part}** Коллеги, сервис работает в штатном режиме. Технические работы завершены.",
+        "EN": "✅ **[{curr}]{provider_part}** Colleagues, the service is fully operational. Maintenance resolved."
     }
+}
+
+TYPE_LABELS = {
+    "std": "⚠️ Стандарт (проблема банка)",
+    "stop": "🛑 Стандарт (банк) + СТОП трафик",
+    "short_std": "⚠️ Стандарт (временные трудности)",
+    "short_stop": "🛑 Стандарт (временные трудности) + СТОП",
 }
 
 
@@ -100,6 +115,25 @@ def escape_md(text: str) -> str:
     return text
 
 
+def provider_part(provider: str) -> str:
+    """Для текста, уходящего мерчантам: ' (Provider)' если провайдер указан, иначе пусто -
+    чтобы не оставались пустые скобки '()' в сообщении, если шаг с провайдером пропустили."""
+    p = (provider or "").strip()
+    return f" ({escape_md(p)})" if p else ""
+
+
+def provider_display(provider: str) -> str:
+    """Для служебных сообщений/отчётов бота: показываем название или пометку, что не указан."""
+    p = (provider or "").strip()
+    return escape_md(p) if p else "не указан"
+
+
+def provider_paren_display(provider: str) -> str:
+    """То же самое, но в скобках, для мест вида 'CURR (Provider)' в отчётах - пустых скобок не будет."""
+    p = (provider or "").strip()
+    return f" ({escape_md(p)})" if p else ""
+
+
 def parse_chat_id(raw_id: str):
     """Разбирает ID вида '-10044442718018_1' на chat_id (-10044442718018) и thread_id (1)"""
     if "_" in raw_id:
@@ -131,6 +165,7 @@ class AuthState(StatesGroup):
 
 class IncidentState(StatesGroup):
     waiting_for_currency = State()
+    waiting_for_label = State()
     waiting_for_provider = State()
     selecting_chats = State()
     waiting_for_type = State()
@@ -575,7 +610,7 @@ async def cmd_force_resolve(message: types.Message):
         data["active_incidents"] = [x for x in data["active_incidents"] if x["id"] != inc_id]
         save_data(data)
         await message.answer(
-            f"✅ Чат `{target_cid}` принудительно закрыт.\n🟢 Это был последний чат — просадка **{escape_md(incident['currency'])} ({escape_md(incident['provider'])})** полностью закрыта.",
+            f"✅ Чат `{target_cid}` принудительно закрыт.\n🟢 Это был последний чат — просадка **{escape_md(incident['currency'])} ({escape_md(incident.get('label') or incident.get('provider') or 'без названия')})** полностью закрыта.",
             parse_mode="Markdown"
         )
     else:
@@ -666,13 +701,74 @@ async def process_currency(callback: types.CallbackQuery, state: FSMContext):
                                                 parse_mode="Markdown")
 
     await state.update_data(selected_currency=currency, target_chats=target_chats)
-    await state.set_state(IncidentState.waiting_for_provider)
+    await state.set_state(IncidentState.waiting_for_label)
 
     await callback.message.edit_text(
-        f"Валюта: **{currency}**.\nУкажите банк / провайдера (например: *Kapitalbank* или *P2P Gateway*):",
+        f"Валюта: **{currency}**.\nКак назовём эту просадку? (для внутренней истории, мерчанты этого не увидят):",
         parse_mode="Markdown",
         reply_markup=cancel_only_keyboard()
     )
+
+
+@dp.message(IncidentState.waiting_for_label, F.chat.type == "private")
+async def process_label(message: types.Message, state: FSMContext):
+    if is_reserved_input(message.text):
+        await state.clear()
+        return await message.answer(
+            "⚠️ Действие отменено (получена кнопка меню или команда вместо текста).\n"
+            "Если это была команда - отправьте её ещё раз, теперь она сработает.",
+            reply_markup=main_keyboard()
+        )
+
+    label = message.text.strip()
+    if not label:
+        return await message.answer(
+            "⚠️ Название не может быть пустым. Введите текст ещё раз:",
+            reply_markup=cancel_only_keyboard()
+        )
+
+    await state.update_data(label=label)
+    await state.set_state(IncidentState.waiting_for_provider)
+
+    provider_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➡️ Пропустить (не показывать мерчантам)", callback_data="skip_provider")],
+        cancel_button_row()
+    ])
+    await message.answer(
+        f"Просадка: **{escape_md(label)}**.\nЧто показать мерчантам в скобках? (например банк) - можно пропустить, тогда скобок в сообщении не будет вообще:",
+        parse_mode="Markdown",
+        reply_markup=provider_kb
+    )
+
+
+async def proceed_to_chat_selection(answer_target, state: FSMContext, provider: str):
+    """Общий переход от 'указан/пропущен провайдер (для мерчантов)' к выбору чатов - используется и для
+    текстового ввода, и для нажатия кнопки 'Пропустить'."""
+    user_data = await state.get_data()
+    target_chats = user_data["target_chats"]
+    currency = user_data["selected_currency"]
+    label = user_data["label"]
+    selected_chat_ids = [str(cid) for cid in target_chats.keys()]
+
+    await state.update_data(
+        provider=provider,
+        selected_chat_ids=selected_chat_ids
+    )
+    await state.set_state(IncidentState.selecting_chats)
+
+    kb = build_chats_selection_keyboard(target_chats, selected_chat_ids, action_type="alert")
+    provider_shown = escape_md(provider) if provider.strip() else "ничего (скобок не будет)"
+    await answer_target.answer(
+        f"Просадка: **{escape_md(label)}** | Валюта: **{currency}**\nМерчантам покажем: **{provider_shown}**\nОтметьте чаты, в которые нужно отправить сообщение:",
+        reply_markup=kb,
+        parse_mode="Markdown"
+    )
+
+
+@dp.callback_query(IncidentState.waiting_for_provider, F.data == "skip_provider")
+async def skip_provider(callback: types.CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await proceed_to_chat_selection(callback.message, state, "")
 
 
 @dp.message(IncidentState.waiting_for_provider, F.chat.type == "private")
@@ -686,24 +782,7 @@ async def process_provider(message: types.Message, state: FSMContext):
         )
 
     provider = message.text.strip()
-    user_data = await state.get_data()
-
-    target_chats = user_data["target_chats"]
-    currency = user_data["selected_currency"]
-    selected_chat_ids = [str(cid) for cid in target_chats.keys()]
-
-    await state.update_data(
-        provider=provider,
-        selected_chat_ids=selected_chat_ids
-    )
-    await state.set_state(IncidentState.selecting_chats)
-
-    kb = build_chats_selection_keyboard(target_chats, selected_chat_ids, action_type="alert")
-    await message.answer(
-        f"Валюта: **{currency}** | Источник: **{escape_md(provider)}**.\nОтметьте чаты, в которые нужно отправить сообщение:",
-        reply_markup=kb,
-        parse_mode="Markdown"
-    )
+    await proceed_to_chat_selection(message, state, provider)
 
 
 @dp.callback_query(IncidentState.selecting_chats, F.data.startswith("togglechat_"))
@@ -731,6 +810,7 @@ async def finish_chat_selection(callback: types.CallbackQuery, state: FSMContext
     selected_chat_ids = user_data["selected_chat_ids"]
     currency = user_data["selected_currency"]
     provider = user_data["provider"]
+    label = user_data["label"]
 
     if not selected_chat_ids:
         return await callback.answer("⚠️ Выберите хотя бы один чат!", show_alert=True)
@@ -738,14 +818,17 @@ async def finish_chat_selection(callback: types.CallbackQuery, state: FSMContext
     await state.set_state(IncidentState.waiting_for_type)
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⚠️ Стандарт (Работы на стороне банка)", callback_data="type_std")],
-        [InlineKeyboardButton(text="🛑 Стандарт + СТОП трафик", callback_data="type_stop")],
+        [InlineKeyboardButton(text="⚠️ Стандарт (проблема банка)", callback_data="type_std")],
+        [InlineKeyboardButton(text="🛑 Стандарт (банк) + СТОП трафик", callback_data="type_stop")],
+        [InlineKeyboardButton(text="⚠️ Стандарт (временные трудности)", callback_data="type_short_std")],
+        [InlineKeyboardButton(text="🛑 Стандарт (временные трудности) + СТОП", callback_data="type_short_stop")],
         [InlineKeyboardButton(text="✏️ Ввести свой текст", callback_data="type_custom")],
         cancel_button_row()
     ])
 
+    provider_shown = escape_md(provider) if provider.strip() else "ничего (скобок не будет)"
     await callback.message.edit_text(
-        f"Валюта: **{currency}** | Источник: **{escape_md(provider)}** (чатов: **{len(selected_chat_ids)}**).\nВыберите тип оповещения:",
+        f"Просадка: **{escape_md(label)}** | Валюта: **{currency}**\nМерчантам покажем: **{provider_shown}**\nЧатов: **{len(selected_chat_ids)}**.\nВыберите тип оповещения:",
         reply_markup=kb,
         parse_mode="Markdown"
     )
@@ -753,7 +836,7 @@ async def finish_chat_selection(callback: types.CallbackQuery, state: FSMContext
 
 @dp.callback_query(IncidentState.waiting_for_type, F.data.startswith("type_"))
 async def process_type(callback: types.CallbackQuery, state: FSMContext):
-    msg_type = callback.data.split("_")[1]
+    msg_type = callback.data[len("type_"):]  # всё после "type_" - чтобы не ломалось на "short_std"/"short_stop"
 
     if msg_type == "custom":
         await state.set_state(IncidentState.waiting_for_custom_text_ru)
@@ -769,6 +852,7 @@ async def process_type(callback: types.CallbackQuery, state: FSMContext):
         target_msg=callback.message,
         currency=user_data["selected_currency"],
         provider=user_data["provider"],
+        label=user_data["label"],
         target_chats=user_data["target_chats"],
         selected_chat_ids=user_data["selected_chat_ids"],
         template_key=msg_type
@@ -799,6 +883,7 @@ async def process_custom_text_ru(message: types.Message, state: FSMContext):
             target_msg=message,
             currency=user_data["selected_currency"],
             provider=user_data["provider"],
+            label=user_data["label"],
             target_chats=target_chats,
             selected_chat_ids=selected_chat_ids,
             custom_texts={"RU": message.text, "EN": message.text}
@@ -829,6 +914,7 @@ async def process_custom_text_en(message: types.Message, state: FSMContext):
         target_msg=message,
         currency=user_data["selected_currency"],
         provider=user_data["provider"],
+        label=user_data["label"],
         target_chats=user_data["target_chats"],
         selected_chat_ids=user_data["selected_chat_ids"],
         custom_texts={"RU": user_data["custom_text_ru"], "EN": message.text}
@@ -870,13 +956,23 @@ async def send_with_thread_fallback(chat_id, thread_id, text, reply_to_message_i
         return msg, None, True
 
 
-async def send_alert(target_msg: types.Message, currency: str, provider: str, target_chats: dict, selected_chat_ids: list,
+async def send_alert(target_msg: types.Message, currency: str, provider: str, label: str, target_chats: dict, selected_chat_ids: list,
                      template_key: str = None, custom_texts: dict = None):
     data = load_data()
     sent_messages = []
     failed = []
     warnings = []
     selected_chat_ids_str = [str(x) for x in selected_chat_ids]
+
+    # базовый текст (без тегов cc, которые у каждого чата свои) - для отображения в "🔍 Подробнее"
+    if custom_texts:
+        text_ru = escape_md(custom_texts.get("RU", ""))
+        text_en = escape_md(custom_texts.get("EN", custom_texts.get("RU", "")))
+        type_label = "Свой текст"
+    else:
+        text_ru = TEMPLATES[template_key]["RU"].format(curr=escape_md(currency), provider_part=provider_part(provider))
+        text_en = TEMPLATES[template_key]["EN"].format(curr=escape_md(currency), provider_part=provider_part(provider))
+        type_label = TYPE_LABELS.get(template_key, template_key)
 
     for cid_str in selected_chat_ids_str:
         info = target_chats.get(cid_str, {})
@@ -895,7 +991,7 @@ async def send_alert(target_msg: types.Message, currency: str, provider: str, ta
             raw_text = custom_texts.get(lang, custom_texts.get("RU", ""))
             alert_text = escape_md(raw_text)
         else:
-            alert_text = TEMPLATES[template_key][lang].format(curr=escape_md(currency), provider=escape_md(provider))
+            alert_text = TEMPLATES[template_key][lang].format(curr=escape_md(currency), provider_part=provider_part(provider))
 
         if tags:
             safe_tags = [escape_md(t) for t in tags]
@@ -921,11 +1017,15 @@ async def send_alert(target_msg: types.Message, currency: str, provider: str, ta
         "id": incident_id,
         "currency": currency,
         "provider": provider,
+        "label": label,
+        "type_label": type_label,
+        "text_ru": text_ru,
+        "text_en": text_en,
         "messages": sent_messages
     })
     save_data(data)
 
-    report = f"✅ Оповещение по **{escape_md(currency)} ({escape_md(provider)})** отправлено в {len(sent_messages)} чат(ов)!"
+    report = f"✅ Оповещение по **{escape_md(currency)}{provider_paren_display(provider)}** отправлено в {len(sent_messages)} чат(ов)!"
     if warnings:
         report += f"\n\n⚠️ **Автоматически перенаправлено в General ({len(warnings)}):**\n" + "\n".join(warnings)
     if failed:
@@ -951,9 +1051,9 @@ async def resolve_incident_start(message: types.Message):
     for inc in active:
         inc_id = inc["id"]
         curr = inc["currency"]
-        prov = inc["provider"]
+        label = inc.get("label") or inc.get("provider") or "без названия"
         chat_count = len(inc.get("messages", []))
-        btn_text = f"{curr} — {prov} ({chat_count} чат)"
+        btn_text = f"{curr} — {label} ({chat_count} чат)"
         buttons.append([InlineKeyboardButton(text=btn_text, callback_data=f"resolveinc_{inc_id}")])
 
     kb = InlineKeyboardMarkup(inline_keyboard=buttons + [cancel_button_row()])
@@ -991,7 +1091,7 @@ async def resolve_incident_select_chats(callback: types.CallbackQuery, state: FS
 
     kb = build_chats_selection_keyboard(active_incident_chats, selected_resolve_ids, action_type="resolve")
     await callback.message.edit_text(
-        f"Восстановление: **{incident['currency']}** (**{incident['provider']}**).\nОтметьте чаты, в которых нужно зафиксировать восстановление:",
+        f"Восстановление: **{escape_md(incident['currency'])} ({escape_md(incident.get('label') or incident.get('provider') or 'без названия')})**.\nОтметьте чаты, в которых нужно зафиксировать восстановление:",
         reply_markup=kb,
         parse_mode="Markdown"
     )
@@ -1038,6 +1138,7 @@ async def finish_resolve_process(callback: types.CallbackQuery, state: FSMContex
     remaining_messages = []
     currency = incident["currency"]
     provider = incident["provider"]
+    label = incident.get("label") or provider or "без названия"
 
     for item in incident["messages"]:
         cid_str = str(item.get("chat_key", item["chat_id"]))
@@ -1052,7 +1153,7 @@ async def finish_resolve_process(callback: types.CallbackQuery, state: FSMContex
             if not chat_id:
                 chat_id, thread_id = parse_chat_id(cid_str)
 
-            resolve_text = TEMPLATES["resolve"][lang].format(curr=escape_md(currency), provider=escape_md(provider))
+            resolve_text = TEMPLATES["resolve"][lang].format(curr=escape_md(currency), provider_part=provider_part(provider))
             if tags:
                 safe_tags = [escape_md(t) for t in tags]
                 resolve_text += f"\n\n📌 **cc:** {' '.join(safe_tags)}"
@@ -1080,10 +1181,10 @@ async def finish_resolve_process(callback: types.CallbackQuery, state: FSMContex
 
     if remaining_messages:
         incident["messages"] = remaining_messages
-        status_msg = f"🟢 Восстановление по **{escape_md(currency)} ({escape_md(provider)})** зафиксировано в {resolved_count} чат(ах).\n⚠️ Осталось чатов в этой просадке: **{len(remaining_messages)}**."
+        status_msg = f"🟢 Восстановление по **{escape_md(currency)} ({escape_md(label)})** зафиксировано в {resolved_count} чат(ах).\n⚠️ Осталось чатов в этой просадке: **{len(remaining_messages)}**."
     else:
         data["active_incidents"] = [x for x in data["active_incidents"] if x["id"] != inc_id]
-        status_msg = f"🟢 Просадка по **{escape_md(currency)} ({escape_md(provider)})** полностью закрыта!"
+        status_msg = f"🟢 Просадка по **{escape_md(currency)} ({escape_md(label)})** полностью закрыта!"
 
     if failed:
         status_msg += f"\n\n❌ **Не удалось отправить восстановление в {len(failed)} чат(ов):**\n" + "\n".join(failed)
@@ -1115,18 +1216,61 @@ async def show_incidents(message: types.Message):
     text = "🔴 **Активные просадки в данный момент:**\n\n"
     for inc in active:
         msg_count = len(inc.get("messages", []))
-        text += f"• `id {inc['id']}` **{escape_md(inc['currency'])}** ({escape_md(inc['provider'])}) — активна в {msg_count} чат(ах)\n"
+        label = inc.get("label") or inc.get("provider") or "без названия"
+        text += f"• `id {inc['id']}` **{escape_md(inc['currency'])}** ({escape_md(label)}) — активна в {msg_count} чат(ах)\n"
 
-    buttons = [
-        [InlineKeyboardButton(
-            text=f"🗑 Удалить id {inc['id']} ({inc['currency']} · {inc['provider']}) без уведомления",
-            callback_data=f"silentremove_{inc['id']}"
-        )]
-        for inc in active
-    ]
+    buttons = []
+    for inc in active:
+        label = inc.get("label") or inc.get("provider") or "без названия"
+        buttons.append([
+            InlineKeyboardButton(text=f"🔍 Подробнее id {inc['id']}", callback_data=f"incdetails_{inc['id']}"),
+            InlineKeyboardButton(text=f"🗑 Удалить id {inc['id']}", callback_data=f"silentremove_{inc['id']}")
+        ])
     kb = InlineKeyboardMarkup(inline_keyboard=buttons)
 
     await message.answer(text, reply_markup=kb, parse_mode="Markdown")
+
+
+@dp.callback_query(F.data.startswith("incdetails_"))
+async def show_incident_details(callback: types.CallbackQuery):
+    """Показывает подробности инцидента: название, валюту, что видят мерчанты, тип оповещения и сам текст."""
+    if not is_authorized(callback.from_user.id):
+        return await callback.answer("🛑 Нет доступа", show_alert=True)
+
+    inc_id = int(callback.data.split("_")[1])
+    data = load_data()
+    incident = next((x for x in data.get("active_incidents", []) if x["id"] == inc_id), None)
+
+    if not incident:
+        return await callback.answer("Уже закрыт или не найден", show_alert=True)
+
+    await callback.answer()
+
+    label = incident.get("label") or incident.get("provider") or "без названия"
+    provider = incident.get("provider", "")
+    provider_shown = escape_md(provider) if provider.strip() else "ничего (без скобок)"
+    type_label = incident.get("type_label", "неизвестно (создан старой версией бота)")
+    text_ru = incident.get("text_ru")
+    text_en = incident.get("text_en")
+
+    details = (
+        f"🔍 **Подробности просадки id {inc_id}**\n\n"
+        f"Название: **{escape_md(label)}**\n"
+        f"Валюта: **{escape_md(incident['currency'])}**\n"
+        f"Мерчантам показано: **{provider_shown}**\n"
+        f"Тип оповещения: **{escape_md(type_label)}**\n"
+        f"Чатов: **{len(incident.get('messages', []))}**\n"
+    )
+
+    if text_ru:
+        details += f"\n**Текст (RU):**\n{text_ru}"
+    if text_en and text_en != text_ru:
+        details += f"\n\n**Текст (EN):**\n{text_en}"
+    if not text_ru and not text_en:
+        details += "\n_Текст не сохранён - инцидент создан до этой функции._"
+
+    for chunk_start in range(0, len(details), 3500):
+        await callback.message.answer(details[chunk_start:chunk_start + 3500], parse_mode="Markdown")
 
 
 @dp.callback_query(F.data.startswith("silentremove_"))
@@ -1148,7 +1292,7 @@ async def silent_remove_incident(callback: types.CallbackQuery):
 
     await callback.answer("Удалено без уведомления чатов")
     await callback.message.edit_text(
-        f"🗑 Просадка **{escape_md(incident['currency'])} ({escape_md(incident['provider'])})** удалена из списка активных.\n"
+        f"🗑 Просадка **{escape_md(incident['currency'])} ({escape_md(incident.get('label') or incident.get('provider') or 'без названия')})** удалена из списка активных.\n"
         f"Сообщения о восстановлении никуда не отправлялись.",
         parse_mode="Markdown"
     )
