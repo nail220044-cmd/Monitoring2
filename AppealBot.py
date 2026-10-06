@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import sys
+from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command
@@ -18,7 +19,7 @@ TOKEN = os.getenv("BOT_TOKEN")
 SECRET_PASSWORD = os.getenv("SECRET_PASSWORD")
 
 if not TOKEN or not SECRET_PASSWORD:
-    print("❌ ОШИБКА: Переменные BOT_TOKEN или SECRET_PASSWORD не найдены в файле ..env!")
+    print("❌ ОШИБКА: Переменные BOT_TOKEN или SECRET_PASSWORD не найдены в файле .env!")
     sys.exit(1)
 
 # Персистентная папка на ботхосте (сохраняется между пересборками контейнера)
@@ -31,28 +32,118 @@ except Exception:
 DATA_FILE = os.path.join(DATA_DIR, "data.json")
 CURRENCIES = ["EGP", "ARS", "UZS", "AUD", "AZN", "KGS", "MNT"]
 
+# Смещение для отображения времени в "🔍 Подробнее" (по умолчанию МСК, UTC+3). Можно задать TZ_OFFSET_HOURS в .env
+try:
+    TZ_OFFSET_HOURS = float(os.getenv("TZ_OFFSET_HOURS", "3"))
+except ValueError:
+    TZ_OFFSET_HOURS = 3.0
+LOCAL_TZ = timezone(timedelta(hours=TZ_OFFSET_HOURS))
+
+# ------------------- КАНАЛЫ (ПРИЁМНЫЙ / ВЫПЛАТНОЙ) -------------------
+CHANNEL_DEPOSIT = "deposit"
+CHANNEL_PAYOUT = "payout"
+CHANNEL_ORDER = [CHANNEL_DEPOSIT, CHANNEL_PAYOUT]
+
+CHANNEL_BUTTON_LABELS = {
+    CHANNEL_DEPOSIT: "📥 Приёмный канал",
+    CHANNEL_PAYOUT: "📤 Выплатной канал",
+}
+CHANNEL_ICONS = {CHANNEL_DEPOSIT: "📥", CHANNEL_PAYOUT: "📤"}
+CHANNEL_ADMIN_NAMES = {CHANNEL_DEPOSIT: "📥 Приёмный", CHANNEL_PAYOUT: "📤 Выплатной"}
+
+# Фразы, которые подставляются в тексты для мерчантов. Ключ - какие каналы затронуты:
+# deposit / payout / both / none (none - запасной вариант, если каналы не заданы).
+CHANNEL_PHRASES = {
+    "RU": {
+        "on": {
+            "deposit": "по приёмному каналу",
+            "payout": "по выплатному каналу",
+            "both": "по приёмному и выплатному каналам",
+            "none": "по данной валюте",
+        },
+        "affecting": {
+            "deposit": "по приёмному каналу",
+            "payout": "по выплатному каналу",
+            "both": "по приёмному и выплатному каналам",
+            "none": "по данной валюте",
+        },
+        "restored": {
+            "deposit": "приёмный канал восстановлен",
+            "payout": "выплатной канал восстановлен",
+            "both": "приёмный и выплатной каналы восстановлены",
+            "none": "сервис восстановлен",
+        },
+        # фраза про НЕзатронутый канал - чтобы мерчант не отключал всё подряд (только когда затронут один канал)
+        "unaffected": {
+            "deposit": " По выплатному каналу ограничений нет.",
+            "payout": " По приёмному каналу ограничений нет.",
+            "both": "",
+            "none": "",
+        },
+    },
+    "EN": {
+        "on": {
+            "deposit": "on the deposit channel",
+            "payout": "on the payout channel",
+            "both": "on the deposit and payout channels",
+            "none": "for this currency",
+        },
+        "affecting": {
+            "deposit": "affecting the deposit channel",
+            "payout": "affecting the payout channel",
+            "both": "affecting the deposit and payout channels",
+            "none": "affecting this currency",
+        },
+        "restored": {
+            "deposit": "the deposit channel has been restored",
+            "payout": "the payout channel has been restored",
+            "both": "the deposit and payout channels have been restored",
+            "none": "the service has been restored",
+        },
+        "unaffected": {
+            "deposit": " There are no restrictions on the payout channel.",
+            "payout": " There are no restrictions on the deposit channel.",
+            "both": "",
+            "none": "",
+        },
+    },
+}
+
 # ------------------- СЛОВАРЬ ШАБЛОНОВ (RU / EN) -------------------
+# Плейсхолдеры: {curr}, {provider_part} (банк в скобках или пусто), {affecting}/{channels_on} (каналы),
+# {unaffected} (фраза про незатронутый канал), {restored}/{remaining_on} (для восстановления).
 TEMPLATES = {
     "std": {
-        "RU": "⚠️ **[{curr}]{provider_part}** Коллеги, на стороне банка наблюдаются технические трудности, из-за чего могут происходить отмены и задержки платежей. На нашей стороне всё работает штатно, трафик приостанавливать не требуется. Мы сообщим вам о восстановлении.",
-        "EN": "⚠️ **[{curr}]{provider_part}** Colleagues, technical issues are currently observed on the bank's side, which may cause failed transactions and delays. Systems on our side are operating normally; traffic does not need to be stopped. We'll let you know once restored."
+        "RU": "⚠️ **[{curr}]{provider_part}** Коллеги, на стороне банка наблюдаются технические трудности {affecting}, из-за чего могут происходить отмены и задержки платежей. На нашей стороне всё работает штатно, трафик приостанавливать не требуется. Мы сообщим вам о восстановлении.",
+        "EN": "⚠️ **[{curr}]{provider_part}** Colleagues, technical issues are currently observed on the bank's side {affecting}, which may cause failed transactions and delays. Systems on our side are operating normally; traffic does not need to be stopped. We'll let you know once restored."
     },
     "stop": {
-        "RU": "⚠️ **[{curr}]{provider_part}** Коллеги, на стороне банка ведутся технические работы, в связи с чем могут быть отмены и снижение конверсии.\n🛑 **Просим временно остановить трафик по данной валюте.**\nМы сообщим вам о восстановлении.",
-        "EN": "⚠️ **[{curr}]{provider_part}** Colleagues, technical maintenance is undergoing on the bank's side, which may result in higher failure rates and lower conversion.\n🛑 **Please temporarily stop processing traffic for this currency.**\nWe will let you know once restored."
+        "RU": "⚠️ **[{curr}]{provider_part}** Коллеги, на стороне банка ведутся технические работы {affecting}, в связи с чем могут быть отмены и снижение конверсии.\n🛑 **Просим временно остановить трафик {channels_on}.**{unaffected}\nМы сообщим вам о восстановлении.",
+        "EN": "⚠️ **[{curr}]{provider_part}** Colleagues, technical maintenance is undergoing on the bank's side {affecting}, which may result in higher failure rates and lower conversion.\n🛑 **Please temporarily stop processing traffic {channels_on}.**{unaffected}\nWe will let you know once restored."
     },
     "short_std": {
-        "RU": "⚠️ **[{curr}]** Коллеги, в данный момент наблюдаются временные технические трудности, из-за чего возможны отмены и задержки платежей. Трафик приостанавливать не требуется. О восстановлении сообщим дополнительно.",
-        "EN": "⚠️ **[{curr}]** Colleagues, we are currently experiencing temporary technical issues, which may cause failed transactions and delays. Traffic does not need to be paused. We will notify you once resolved."
+        "RU": "⚠️ **[{curr}]{provider_part}** Коллеги, в данный момент наблюдаются временные технические трудности {affecting}, из-за чего возможны отмены и задержки платежей. Трафик приостанавливать не требуется. О восстановлении сообщим дополнительно.",
+        "EN": "⚠️ **[{curr}]{provider_part}** Colleagues, we are currently experiencing temporary technical issues {affecting}, which may cause failed transactions and delays. Traffic does not need to be paused. We will notify you once resolved."
     },
     "short_stop": {
-        "RU": "⚠️ **[{curr}]** Коллеги, в данный момент наблюдаются временные технические трудности, в связи с чем возможны отмены платежей и снижение конверсии.\n🛑 **Просим временно приостановить трафик по данной валюте.**\nО восстановлении сообщим дополнительно.",
-        "EN": "⚠️ **[{curr}]** Colleagues, we are currently experiencing temporary technical issues, which may result in failed transactions and lower conversion.\n🛑 **Please temporarily pause traffic for this currency.**\nWe will notify you once resolved."
+        "RU": "⚠️ **[{curr}]{provider_part}** Коллеги, в данный момент наблюдаются временные технические трудности {affecting}, в связи с чем возможны отмены платежей и снижение конверсии.\n🛑 **Просим временно приостановить трафик {channels_on}.**{unaffected}\nО восстановлении сообщим дополнительно.",
+        "EN": "⚠️ **[{curr}]{provider_part}** Colleagues, we are currently experiencing temporary technical issues {affecting}, which may result in failed transactions and lower conversion.\n🛑 **Please temporarily pause traffic {channels_on}.**{unaffected}\nWe will notify you once resolved."
     },
+    # восстановление без каналов (старые просадки, созданные до появления каналов)
     "resolve": {
         "RU": "✅ **[{curr}]{provider_part}** Коллеги, сервис работает в штатном режиме. Технические работы завершены.",
         "EN": "✅ **[{curr}]{provider_part}** Colleagues, the service is fully operational. Maintenance resolved."
-    }
+    },
+    # восстановление: все затронутые каналы восстановлены
+    "resolve_channels": {
+        "RU": "✅ **[{curr}]{provider_part}** Коллеги, {restored}, сервис работает в штатном режиме. Технические работы завершены.",
+        "EN": "✅ **[{curr}]{provider_part}** Colleagues, {restored}, and the service is fully operational. Maintenance resolved."
+    },
+    # восстановление: вернулся один канал, по второму ограничения сохраняются
+    "resolve_partial": {
+        "RU": "✅ **[{curr}]{provider_part}** Коллеги, {restored}.\n⚠️ Ограничения {remaining_on} сохраняются, о восстановлении сообщим дополнительно.",
+        "EN": "✅ **[{curr}]{provider_part}** Colleagues, {restored}.\n⚠️ Restrictions {remaining_on} remain in place; we will notify you once resolved."
+    },
 }
 
 TYPE_LABELS = {
@@ -134,6 +225,138 @@ def provider_paren_display(provider: str) -> str:
     return f" ({escape_md(p)})" if p else ""
 
 
+def normalize_channels(channels):
+    """Приводит список каналов к каноничному виду (только известные, в фиксированном порядке)."""
+    return [c for c in CHANNEL_ORDER if c in (channels or [])]
+
+
+def channel_phrase(lang: str, kind: str, channels) -> str:
+    ch = normalize_channels(channels)
+    key = "both" if len(ch) >= 2 else (ch[0] if ch else "none")
+    table = CHANNEL_PHRASES.get(lang, CHANNEL_PHRASES["RU"])
+    return table[kind][key]
+
+
+def render_template(key: str, lang: str, currency: str, provider: str, channels=None, restored=None, remaining=None) -> str:
+    """Собирает текст для мерчанта из шаблона: валюта, банк в скобках (если указан), каналы."""
+    lang = lang if lang in ("RU", "EN") else "RU"
+    return TEMPLATES[key][lang].format(
+        curr=escape_md(currency),
+        provider_part=provider_part(provider),
+        channels_on=channel_phrase(lang, "on", channels),
+        affecting=channel_phrase(lang, "affecting", channels),
+        unaffected=channel_phrase(lang, "unaffected", channels),
+        restored=channel_phrase(lang, "restored", restored),
+        remaining_on=channel_phrase(lang, "on", remaining),
+    )
+
+
+def active_channels(incident: dict) -> list:
+    """Каналы, по которым просадка ещё активна (объединение по всем чатам просадки)."""
+    found = set()
+    for m in incident.get("messages", []):
+        found.update(m.get("channels") or [])
+    return normalize_channels(found)
+
+
+def channels_of_selected(incident: dict, selected_ids) -> list:
+    found = set()
+    for m in incident.get("messages", []):
+        cid = str(m.get("chat_key", m.get("chat_id")))
+        if cid in selected_ids:
+            found.update(m.get("channels") or [])
+    return normalize_channels(found)
+
+
+def channel_icons(channels) -> str:
+    return "".join(CHANNEL_ICONS[c] for c in normalize_channels(channels))
+
+
+def channel_names_admin(channels) -> str:
+    return ", ".join(CHANNEL_ADMIN_NAMES[c] for c in normalize_channels(channels))
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def format_local_time(iso_str):
+    """ISO-время (UTC) -> '29.09.2026 05:12 (UTC+3)'. Если времени нет или оно битое - None."""
+    if not iso_str:
+        return None
+    try:
+        dt = datetime.fromisoformat(iso_str)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        local = dt.astimezone(LOCAL_TZ)
+    except Exception:
+        return None
+    sign = "+" if TZ_OFFSET_HOURS >= 0 else "-"
+    return local.strftime("%d.%m.%Y %H:%M") + f" (UTC{sign}{abs(TZ_OFFSET_HOURS):g})"
+
+
+def notified_merchants(incident: dict, chats_registry: dict) -> list:
+    """Названия мерчантов, которых оповестили. Для старых просадок берём из текущих чатов."""
+    names = incident.get("notified_names")
+    if names:
+        return list(names)
+    result = []
+    for m in incident.get("messages", []):
+        name = m.get("name")
+        if not name:
+            cid = str(m.get("chat_key", m.get("chat_id")))
+            name = chats_registry.get(cid, {}).get("name", cid)
+        result.append(name)
+    return result
+
+
+def build_incident_details(incident: dict, chats_registry: dict) -> str:
+    """Текст карточки '🔍 Подробнее': название, валюта, каналы, время, мерчанты, тип и сам текст оповещения."""
+    label = incident.get("label") or incident.get("provider") or "без названия"
+    provider = (incident.get("provider") or "").strip()
+    provider_shown = escape_md(provider) if provider else "ничего (без скобок)"
+    type_label = incident.get("type_label", "неизвестно (создана старой версией бота)")
+    created = format_local_time(incident.get("created_at")) or "неизвестно (создана старой версией бота)"
+    initial_ch = normalize_channels(incident.get("channels"))
+    now_ch = active_channels(incident)
+
+    lines = [
+        f"🔍 **Подробности просадки id {incident['id']}**",
+        "",
+        f"Название: **{escape_md(label)}**",
+        f"Валюта: **{escape_md(incident['currency'])}**",
+    ]
+    if initial_ch:
+        if now_ch == initial_ch:
+            lines.append(f"Каналы: **{channel_names_admin(now_ch)}**")
+        else:
+            lines.append(f"Каналы сейчас: **{channel_names_admin(now_ch) or '—'}** (изначально: {channel_names_admin(initial_ch)})")
+    lines += [
+        f"Мерчантам показано: **{provider_shown}**",
+        f"Тип оповещения: **{escape_md(type_label)}**",
+        f"Создана: **{created}**",
+    ]
+
+    names = notified_merchants(incident, chats_registry)
+    limit = 30
+    shown = ", ".join(escape_md(n) for n in names[:limit])
+    if len(names) > limit:
+        shown += f" и ещё {len(names) - limit}"
+    lines.append(f"Оповещены ({len(names)}): {shown if shown else '—'}")
+    lines.append(f"Сейчас активна в: **{len(incident.get('messages', []))}** чат(ах)")
+
+    text_ru = incident.get("text_ru")
+    text_en = incident.get("text_en")
+    details = "\n".join(lines)
+    if text_ru:
+        details += f"\n\n**Текст (RU):**\n{text_ru}"
+    if text_en and text_en != text_ru:
+        details += f"\n\n**Текст (EN):**\n{text_en}"
+    if not text_ru and not text_en:
+        details += "\n\n_Текст не сохранён - просадка создана до этой функции._"
+    return details
+
+
 def parse_chat_id(raw_id: str):
     """Разбирает ID вида '-10044442718018_1' на chat_id (-10044442718018) и thread_id (1)"""
     if "_" in raw_id:
@@ -169,12 +392,14 @@ class IncidentState(StatesGroup):
     waiting_for_provider = State()
     selecting_chats = State()
     waiting_for_type = State()
+    selecting_channels = State()
     waiting_for_custom_text_ru = State()
     waiting_for_custom_text_en = State()
 
 
 class ResolveState(StatesGroup):
     selecting_resolve_chats = State()
+    selecting_resolve_channels = State()
 
 
 # ------------------- КЛАВИАТУРЫ -------------------
@@ -238,6 +463,26 @@ def build_chats_selection_keyboard(target_chats: dict, selected_chat_ids: list, 
 
 def cancel_only_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[cancel_button_row()])
+
+
+def build_channels_keyboard(selected, available=None, mode="alert"):
+    """Кнопки выбора каналов. mode='alert' - при создании оповещения, mode='resolve' - при восстановлении."""
+    selected = set(normalize_channels(selected))
+    shown = normalize_channels(available) if available else list(CHANNEL_ORDER)
+    toggle_prefix = "togglech_" if mode == "alert" else "toggleresch_"
+
+    rows = []
+    for ch in shown:
+        icon = "✅" if ch in selected else "❌"
+        rows.append([InlineKeyboardButton(text=f"{icon} {CHANNEL_BUTTON_LABELS[ch]}", callback_data=f"{toggle_prefix}{ch}")])
+
+    if mode == "alert":
+        rows.append([InlineKeyboardButton(text="➡️ ПРОДОЛЖИТЬ", callback_data="channels_done")])
+    else:
+        rows.append([InlineKeyboardButton(text="➡️ ПОДТВЕРДИТЬ ВЫБРАННОЕ", callback_data="resch_done")])
+        rows.append([InlineKeyboardButton(text="✅ Всё восстановилось", callback_data="resch_all")])
+    rows.append(cancel_button_row())
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 @dp.callback_query(F.data == "cancel_flow")
@@ -838,16 +1083,58 @@ async def finish_chat_selection(callback: types.CallbackQuery, state: FSMContext
 async def process_type(callback: types.CallbackQuery, state: FSMContext):
     msg_type = callback.data[len("type_"):]  # всё после "type_" - чтобы не ломалось на "short_std"/"short_stop"
 
-    if msg_type == "custom":
+    # после выбора типа - выбор затронутых каналов (по умолчанию ничего не выбрано, нужно выбрать осознанно)
+    await state.update_data(alert_type=msg_type, channels=[])
+    await state.set_state(IncidentState.selecting_channels)
+    await callback.answer()
+    await callback.message.edit_text(
+        "Какие каналы затронуты? Отметьте один или оба - это попадёт в текст оповещения, "
+        "чтобы мерчанты понимали, по какому направлению трудности:",
+        reply_markup=build_channels_keyboard([])
+    )
+
+
+@dp.callback_query(IncidentState.selecting_channels, F.data.startswith("togglech_"))
+async def toggle_channel(callback: types.CallbackQuery, state: FSMContext):
+    ch = callback.data[len("togglech_"):]
+    if ch not in CHANNEL_ORDER:
+        return await callback.answer()
+
+    user_data = await state.get_data()
+    selected = normalize_channels(user_data.get("channels", []))
+    if ch in selected:
+        selected.remove(ch)
+    else:
+        selected.append(ch)
+    selected = normalize_channels(selected)
+
+    await state.update_data(channels=selected)
+    await callback.answer()
+    await callback.message.edit_reply_markup(reply_markup=build_channels_keyboard(selected))
+
+
+@dp.callback_query(IncidentState.selecting_channels, F.data == "channels_done")
+async def finish_channel_selection(callback: types.CallbackQuery, state: FSMContext):
+    user_data = await state.get_data()
+    selected = normalize_channels(user_data.get("channels", []))
+
+    if not selected:
+        return await callback.answer("⚠️ Выберите хотя бы один канал!", show_alert=True)
+
+    alert_type = user_data["alert_type"]
+
+    if alert_type == "custom":
         await state.set_state(IncidentState.waiting_for_custom_text_ru)
+        await callback.answer()
         await callback.message.edit_text(
-            "✏️ Введите текст на **русском** (уйдёт в чаты с языком RU, отправляется 1 в 1):",
+            "✏️ Введите текст на **русском** (уйдёт в чаты с языком RU, отправляется 1 в 1).\n"
+            "ℹ️ В свой текст ничего не подставляется автоматически (ни банк, ни каналы) - впишите нужное сами.",
             parse_mode="Markdown",
             reply_markup=cancel_only_keyboard()
         )
         return
 
-    user_data = await state.get_data()
+    await callback.answer()
     await send_alert(
         target_msg=callback.message,
         currency=user_data["selected_currency"],
@@ -855,7 +1142,8 @@ async def process_type(callback: types.CallbackQuery, state: FSMContext):
         label=user_data["label"],
         target_chats=user_data["target_chats"],
         selected_chat_ids=user_data["selected_chat_ids"],
-        template_key=msg_type
+        template_key=alert_type,
+        channels=selected
     )
     await state.clear()
 
@@ -886,7 +1174,8 @@ async def process_custom_text_ru(message: types.Message, state: FSMContext):
             label=user_data["label"],
             target_chats=target_chats,
             selected_chat_ids=selected_chat_ids,
-            custom_texts={"RU": message.text, "EN": message.text}
+            custom_texts={"RU": message.text, "EN": message.text},
+            channels=user_data.get("channels", [])
         )
         await state.clear()
         return
@@ -917,7 +1206,8 @@ async def process_custom_text_en(message: types.Message, state: FSMContext):
         label=user_data["label"],
         target_chats=user_data["target_chats"],
         selected_chat_ids=user_data["selected_chat_ids"],
-        custom_texts={"RU": user_data["custom_text_ru"], "EN": message.text}
+        custom_texts={"RU": user_data["custom_text_ru"], "EN": message.text},
+        channels=user_data.get("channels", [])
     )
     await state.clear()
 
@@ -957,8 +1247,9 @@ async def send_with_thread_fallback(chat_id, thread_id, text, reply_to_message_i
 
 
 async def send_alert(target_msg: types.Message, currency: str, provider: str, label: str, target_chats: dict, selected_chat_ids: list,
-                     template_key: str = None, custom_texts: dict = None):
+                     template_key: str = None, custom_texts: dict = None, channels: list = None):
     data = load_data()
+    channels = normalize_channels(channels)
     sent_messages = []
     failed = []
     warnings = []
@@ -970,8 +1261,8 @@ async def send_alert(target_msg: types.Message, currency: str, provider: str, la
         text_en = escape_md(custom_texts.get("EN", custom_texts.get("RU", "")))
         type_label = "Свой текст"
     else:
-        text_ru = TEMPLATES[template_key]["RU"].format(curr=escape_md(currency), provider_part=provider_part(provider))
-        text_en = TEMPLATES[template_key]["EN"].format(curr=escape_md(currency), provider_part=provider_part(provider))
+        text_ru = render_template(template_key, "RU", currency, provider, channels)
+        text_en = render_template(template_key, "EN", currency, provider, channels)
         type_label = TYPE_LABELS.get(template_key, template_key)
 
     for cid_str in selected_chat_ids_str:
@@ -991,7 +1282,7 @@ async def send_alert(target_msg: types.Message, currency: str, provider: str, la
             raw_text = custom_texts.get(lang, custom_texts.get("RU", ""))
             alert_text = escape_md(raw_text)
         else:
-            alert_text = TEMPLATES[template_key][lang].format(curr=escape_md(currency), provider_part=provider_part(provider))
+            alert_text = render_template(template_key, lang, currency, provider, channels)
 
         if tags:
             safe_tags = [escape_md(t) for t in tags]
@@ -1002,7 +1293,10 @@ async def send_alert(target_msg: types.Message, currency: str, provider: str, la
             msg, used_thread_id, fell_back = await send_with_thread_fallback(chat_id, thread_id, alert_text)
             if fell_back:
                 fell_back_note = "ветка недоступна, сообщение ушло в General"
-            sent_messages.append({"chat_key": cid_str, "chat_id": chat_id, "thread_id": used_thread_id, "message_id": msg.message_id, "lang": lang})
+            sent_messages.append({
+                "chat_key": cid_str, "chat_id": chat_id, "thread_id": used_thread_id,
+                "message_id": msg.message_id, "lang": lang, "name": name, "channels": list(channels)
+            })
         except Exception as e:
             err_str = str(e)
             log_error(f"[send_alert] {cid_str} ({name}): {err_str}")
@@ -1011,21 +1305,32 @@ async def send_alert(target_msg: types.Message, currency: str, provider: str, la
         if fell_back_note:
             warnings.append(f"• `{cid_str}` ({escape_md(name)}): {escape_md(fell_back_note)}")
 
-    incident_id = data.get("next_incident_id", 1)
-    data["next_incident_id"] = incident_id + 1
-    data["active_incidents"].append({
-        "id": incident_id,
-        "currency": currency,
-        "provider": provider,
-        "label": label,
-        "type_label": type_label,
-        "text_ru": text_ru,
-        "text_en": text_en,
-        "messages": sent_messages
-    })
-    save_data(data)
+    label_shown = escape_md(label or provider or "без названия")
+    icons = channel_icons(channels)
+    icons_part = f" {icons}" if icons else ""
 
-    report = f"✅ Оповещение по **{escape_md(currency)}{provider_paren_display(provider)}** отправлено в {len(sent_messages)} чат(ов)!"
+    if sent_messages:
+        incident_id = data.get("next_incident_id", 1)
+        data["next_incident_id"] = incident_id + 1
+        data["active_incidents"].append({
+            "id": incident_id,
+            "currency": currency,
+            "provider": provider,
+            "label": label,
+            "channels": list(channels),
+            "created_at": now_iso(),
+            "notified_names": [m["name"] for m in sent_messages],
+            "type_label": type_label,
+            "text_ru": text_ru,
+            "text_en": text_en,
+            "messages": sent_messages
+        })
+        save_data(data)
+        report = f"✅ Оповещение по **{escape_md(currency)} ({label_shown})**{icons_part} отправлено в {len(sent_messages)} чат(ов)!"
+    else:
+        # ни одно сообщение не ушло - пустую просадку не создаём (её нельзя было бы нормально восстановить)
+        report = f"❌ Оповещение по **{escape_md(currency)} ({label_shown})**{icons_part} не отправлено ни в один чат - просадка не создана."
+
     if warnings:
         report += f"\n\n⚠️ **Автоматически перенаправлено в General ({len(warnings)}):**\n" + "\n".join(warnings)
     if failed:
@@ -1053,7 +1358,9 @@ async def resolve_incident_start(message: types.Message):
         curr = inc["currency"]
         label = inc.get("label") or inc.get("provider") or "без названия"
         chat_count = len(inc.get("messages", []))
-        btn_text = f"{curr} — {label} ({chat_count} чат)"
+        icons = channel_icons(active_channels(inc))
+        icons_prefix = f"{icons} " if icons else ""
+        btn_text = f"{icons_prefix}{curr} — {label} ({chat_count} чат)"
         buttons.append([InlineKeyboardButton(text=btn_text, callback_data=f"resolveinc_{inc_id}")])
 
     kb = InlineKeyboardMarkup(inline_keyboard=buttons + [cancel_button_row()])
@@ -1132,7 +1439,84 @@ async def finish_resolve_process(callback: types.CallbackQuery, state: FSMContex
         await state.clear()
         return await callback.message.edit_text("❌ Ошибка: Инцидент уже закрыт.")
 
+    # какие каналы ещё активны в выбранных чатах
+    union = channels_of_selected(incident, selected_resolve_ids)
+
+    await callback.answer()
+    if len(union) >= 2:
+        # активны оба канала - спрашиваем, что именно восстановилось
+        await state.update_data(resolve_available_channels=union, selected_resolve_channels=[])
+        await state.set_state(ResolveState.selecting_resolve_channels)
+        await callback.message.edit_text(
+            "Какие каналы восстановились? Отметьте то, что реально заработало "
+            "(или нажмите «Всё восстановилось»):",
+            reply_markup=build_channels_keyboard([], available=union, mode="resolve")
+        )
+        return
+
+    # активен один канал (или это старая просадка без каналов) - спрашивать нечего
+    await run_resolve(callback, state, restored=union)
+
+
+@dp.callback_query(ResolveState.selecting_resolve_channels, F.data.startswith("toggleresch_"))
+async def toggle_resolve_channel(callback: types.CallbackQuery, state: FSMContext):
+    ch = callback.data[len("toggleresch_"):]
+    user_data = await state.get_data()
+    available = normalize_channels(user_data.get("resolve_available_channels", []))
+    if ch not in available:
+        return await callback.answer()
+
+    selected = normalize_channels(user_data.get("selected_resolve_channels", []))
+    if ch in selected:
+        selected.remove(ch)
+    else:
+        selected.append(ch)
+    selected = normalize_channels(selected)
+
+    await state.update_data(selected_resolve_channels=selected)
+    await callback.answer()
+    await callback.message.edit_reply_markup(
+        reply_markup=build_channels_keyboard(selected, available=available, mode="resolve")
+    )
+
+
+@dp.callback_query(ResolveState.selecting_resolve_channels, F.data == "resch_done")
+async def confirm_resolve_channels(callback: types.CallbackQuery, state: FSMContext):
+    user_data = await state.get_data()
+    selected = normalize_channels(user_data.get("selected_resolve_channels", []))
+    if not selected:
+        return await callback.answer("⚠️ Отметьте хотя бы один восстановившийся канал!", show_alert=True)
+    await callback.answer()
+    await run_resolve(callback, state, restored=selected)
+
+
+@dp.callback_query(ResolveState.selecting_resolve_channels, F.data == "resch_all")
+async def resolve_all_channels(callback: types.CallbackQuery, state: FSMContext):
+    user_data = await state.get_data()
+    available = normalize_channels(user_data.get("resolve_available_channels", []))
+    await callback.answer()
+    await run_resolve(callback, state, restored=available)
+
+
+async def run_resolve(callback: types.CallbackQuery, state: FSMContext, restored: list):
+    """Отправляет сообщения о восстановлении в выбранные чаты. restored - какие каналы восстановились
+    (пусто - старая просадка без каналов). Если в чате остался невосстановленный канал, чат остаётся
+    в просадке только с этим каналом."""
+    user_data = await state.get_data()
+    inc_id = user_data["resolve_inc_id"]
+    selected_resolve_ids = [str(x) for x in user_data["selected_resolve_ids"]]
+    restored = normalize_channels(restored)
+
+    data = load_data()
+    incident = next((x for x in data.get("active_incidents", []) if x["id"] == inc_id), None)
+
+    if not incident or not incident.get("messages"):
+        await state.clear()
+        return await callback.message.edit_text("❌ Ошибка: Инцидент уже закрыт.")
+
     resolved_count = 0
+    partial_count = 0
+    skipped_count = 0
     failed = []
     warnings = []
     remaining_messages = []
@@ -1143,48 +1527,80 @@ async def finish_resolve_process(callback: types.CallbackQuery, state: FSMContex
     for item in incident["messages"]:
         cid_str = str(item.get("chat_key", item["chat_id"]))
 
-        if cid_str in selected_resolve_ids:
-            lang = item.get("lang", "RU")
-            name = data.get("chats", {}).get(cid_str, {}).get("name", cid_str)
-            tags = data.get("chats", {}).get(cid_str, {}).get("tags", [])
-
-            chat_id = item.get("chat_id")
-            thread_id = item.get("thread_id")
-            if not chat_id:
-                chat_id, thread_id = parse_chat_id(cid_str)
-
-            resolve_text = TEMPLATES["resolve"][lang].format(curr=escape_md(currency), provider_part=provider_part(provider))
-            if tags:
-                safe_tags = [escape_md(t) for t in tags]
-                resolve_text += f"\n\n📌 **cc:** {' '.join(safe_tags)}"
-
-            try:
-                _, _, fell_back = await send_with_thread_fallback(chat_id, thread_id, resolve_text, reply_to_message_id=item["message_id"])
-                resolved_count += 1
-                if fell_back:
-                    warnings.append(f"• `{cid_str}` ({escape_md(name)}): ветка недоступна, ушло в General")
-            except Exception as e:
-                log_error(f"[resolve reply] {cid_str} ({name}): {e}")
-                try:
-                    _, _, fell_back = await send_with_thread_fallback(chat_id, thread_id, resolve_text)
-                    resolved_count += 1
-                    if fell_back:
-                        warnings.append(f"• `{cid_str}` ({escape_md(name)}): ветка недоступна, ушло в General")
-                except Exception as ex:
-                    log_error(f"[resolve plain] {cid_str} ({name}): {ex}")
-                    failed.append(f"• `{cid_str}` ({escape_md(name)}): {escape_md(str(ex))}")
-                    # чат не восстановлен - оставляем его в активном инциденте
-                    remaining_messages.append(item)
-                    continue
-        else:
+        if cid_str not in selected_resolve_ids:
             remaining_messages.append(item)
+            continue
 
+        item_channels = normalize_channels(item.get("channels"))
+        if item_channels:
+            restored_here = [c for c in item_channels if c in restored]
+            if not restored_here:
+                # выбранные восстановившиеся каналы к этому чату не относятся - оставляем как есть
+                skipped_count += 1
+                remaining_messages.append(item)
+                continue
+            remaining_here = [c for c in item_channels if c not in restored_here]
+            template_key = "resolve_partial" if remaining_here else "resolve_channels"
+        else:
+            restored_here, remaining_here = [], []
+            template_key = "resolve"
+
+        lang = item.get("lang", "RU")
+        name = item.get("name") or data.get("chats", {}).get(cid_str, {}).get("name", cid_str)
+        tags = data.get("chats", {}).get(cid_str, {}).get("tags", [])
+
+        chat_id = item.get("chat_id")
+        thread_id = item.get("thread_id")
+        if not chat_id:
+            chat_id, thread_id = parse_chat_id(cid_str)
+
+        resolve_text = render_template(template_key, lang, currency, provider, restored=restored_here, remaining=remaining_here)
+        if tags:
+            safe_tags = [escape_md(t) for t in tags]
+            resolve_text += f"\n\n📌 **cc:** {' '.join(safe_tags)}"
+
+        sent_ok = False
+        try:
+            _, _, fell_back = await send_with_thread_fallback(chat_id, thread_id, resolve_text, reply_to_message_id=item["message_id"])
+            sent_ok = True
+        except Exception as e:
+            log_error(f"[resolve reply] {cid_str} ({name}): {e}")
+            try:
+                _, _, fell_back = await send_with_thread_fallback(chat_id, thread_id, resolve_text)
+                sent_ok = True
+            except Exception as ex:
+                log_error(f"[resolve plain] {cid_str} ({name}): {ex}")
+                failed.append(f"• `{cid_str}` ({escape_md(name)}): {escape_md(str(ex))}")
+
+        if not sent_ok:
+            # чат не восстановлен - оставляем его в активном инциденте как был
+            remaining_messages.append(item)
+            continue
+
+        resolved_count += 1
+        if fell_back:
+            warnings.append(f"• `{cid_str}` ({escape_md(name)}): ветка недоступна, ушло в General")
+        if remaining_here:
+            # восстановился только один канал - чат остаётся в просадке с оставшимся каналом
+            item["channels"] = remaining_here
+            remaining_messages.append(item)
+            partial_count += 1
+
+    head = f"**{escape_md(currency)} ({escape_md(label)})**"
     if remaining_messages:
         incident["messages"] = remaining_messages
-        status_msg = f"🟢 Восстановление по **{escape_md(currency)} ({escape_md(label)})** зафиксировано в {resolved_count} чат(ах).\n⚠️ Осталось чатов в этой просадке: **{len(remaining_messages)}**."
+        status_msg = f"🟢 Восстановление по {head} зафиксировано в {resolved_count} чат(ах)."
+        if partial_count:
+            status_msg += f"\n📌 Из них частично (один канал ещё не восстановлен): **{partial_count}**."
+        if skipped_count:
+            status_msg += f"\nℹ️ Не затронуты выбранным каналом и остались как были: **{skipped_count}**."
+        status_msg += f"\n⚠️ Осталось чатов в этой просадке: **{len(remaining_messages)}**."
+        still = active_channels(incident)
+        if still:
+            status_msg += f"\nАктивные каналы: {channel_names_admin(still)}."
     else:
         data["active_incidents"] = [x for x in data["active_incidents"] if x["id"] != inc_id]
-        status_msg = f"🟢 Просадка по **{escape_md(currency)} ({escape_md(label)})** полностью закрыта!"
+        status_msg = f"🟢 Просадка по {head} полностью закрыта!"
 
     if failed:
         status_msg += f"\n\n❌ **Не удалось отправить восстановление в {len(failed)} чат(ов):**\n" + "\n".join(failed)
@@ -1217,7 +1633,9 @@ async def show_incidents(message: types.Message):
     for inc in active:
         msg_count = len(inc.get("messages", []))
         label = inc.get("label") or inc.get("provider") or "без названия"
-        text += f"• `id {inc['id']}` **{escape_md(inc['currency'])}** ({escape_md(label)}) — активна в {msg_count} чат(ах)\n"
+        icons = channel_icons(active_channels(inc))
+        icons_part = f"{icons} " if icons else ""
+        text += f"• `id {inc['id']}` {icons_part}**{escape_md(inc['currency'])}** ({escape_md(label)}) — активна в {msg_count} чат(ах)\n"
 
     buttons = []
     for inc in active:
@@ -1246,31 +1664,15 @@ async def show_incident_details(callback: types.CallbackQuery):
 
     await callback.answer()
 
-    label = incident.get("label") or incident.get("provider") or "без названия"
-    provider = incident.get("provider", "")
-    provider_shown = escape_md(provider) if provider.strip() else "ничего (без скобок)"
-    type_label = incident.get("type_label", "неизвестно (создан старой версией бота)")
-    text_ru = incident.get("text_ru")
-    text_en = incident.get("text_en")
-
-    details = (
-        f"🔍 **Подробности просадки id {inc_id}**\n\n"
-        f"Название: **{escape_md(label)}**\n"
-        f"Валюта: **{escape_md(incident['currency'])}**\n"
-        f"Мерчантам показано: **{provider_shown}**\n"
-        f"Тип оповещения: **{escape_md(type_label)}**\n"
-        f"Чатов: **{len(incident.get('messages', []))}**\n"
-    )
-
-    if text_ru:
-        details += f"\n**Текст (RU):**\n{text_ru}"
-    if text_en and text_en != text_ru:
-        details += f"\n\n**Текст (EN):**\n{text_en}"
-    if not text_ru and not text_en:
-        details += "\n_Текст не сохранён - инцидент создан до этой функции._"
+    details = build_incident_details(incident, data.get("chats", {}))
 
     for chunk_start in range(0, len(details), 3500):
-        await callback.message.answer(details[chunk_start:chunk_start + 3500], parse_mode="Markdown")
+        chunk = details[chunk_start:chunk_start + 3500]
+        try:
+            await callback.message.answer(chunk, parse_mode="Markdown")
+        except Exception:
+            # если разметка сломалась (например, из-за разрезания длинного текста) - отправляем без форматирования
+            await callback.message.answer(chunk)
 
 
 @dp.callback_query(F.data.startswith("silentremove_"))
