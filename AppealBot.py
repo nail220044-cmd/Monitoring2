@@ -170,13 +170,13 @@ TEMPLATES = {
 }
 
 TEMPLATES["resolve_methods"] = {
-    "RU": "✅ **[{curr}]{provider_part}** Коллеги, работа {restored} восстановлена, трафик можно возобновить.",
-    "EN": "✅ **[{curr}]{provider_part}** Colleagues, operations {restored} have been restored, traffic can be resumed.",
+    "RU": "✅ **[{curr}]{provider_part}** Коллеги, работа {restored} восстановлена{resume}.",
+    "EN": "✅ **[{curr}]{provider_part}** Colleagues, operations {restored} have been restored{resume}.",
 }
 TEMPLATES["resolve_methods_partial"] = {
-    "RU": ("✅ **[{curr}]{provider_part}** Коллеги, работа {restored} восстановлена, трафик можно возобновить.\n"
+    "RU": ("✅ **[{curr}]{provider_part}** Коллеги, работа {restored} восстановлена{resume}.\n"
            "⚠️ Ограничения сохраняются: {remaining}. О восстановлении сообщим дополнительно."),
-    "EN": ("✅ **[{curr}]{provider_part}** Colleagues, operations {restored} have been restored, traffic can be resumed.\n"
+    "EN": ("✅ **[{curr}]{provider_part}** Colleagues, operations {restored} have been restored{resume}.\n"
            "⚠️ Restrictions remain in place: {remaining}. We will notify you once resolved."),
 }
 
@@ -320,7 +320,8 @@ def render_template(key: str, lang: str, currency: str, provider: str, channels=
     )
 
 
-def render_method_resolve(lang: str, currency: str, provider: str, restored_pairs: dict, remaining_pairs: dict) -> str:
+def render_method_resolve(lang: str, currency: str, provider: str, restored_pairs: dict, remaining_pairs: dict,
+                          traffic_stopped: bool = True) -> str:
     """Восстановление по методам: 'по приёмному каналу (InstaPay); ...' - сколько методов вернулось и что ещё ограничено."""
     lang = lang if lang in ("RU", "EN") else "RU"
     key = "resolve_methods_partial" if remaining_pairs else "resolve_methods"
@@ -328,6 +329,7 @@ def render_method_resolve(lang: str, currency: str, provider: str, restored_pair
         curr=escape_md(currency),
         provider_part=provider_part(provider),
         restored=outage_group_phrase(lang, restored_pairs, "on"),
+        resume=RESUME_PHRASES[lang] if traffic_stopped else "",
         remaining=outage_group_phrase(lang, remaining_pairs, "nom") if remaining_pairs else "",
     )
 
@@ -474,6 +476,9 @@ def build_incident_details(incident: dict, chats_registry: dict) -> str:
         f"Тип оповещения: **{escape_md(type_label)}**",
         f"Создана: **{created}**",
     ]
+    if is_outage or is_methods:
+        ts = incident_traffic_stopped(incident)
+        lines.append("Просили приостановить трафик: **" + {True: "да", False: "нет", None: "уточним при восстановлении"}[ts] + "**")
 
     names = notified_merchants(incident, chats_registry)
     limit = 30
@@ -569,6 +574,7 @@ class ResolveState(StatesGroup):
     selecting_outage_channels = State()
     selecting_methods = State()
     selecting_method_channels = State()
+    asking_traffic = State()
 
 
 class OutageState(StatesGroup):
@@ -1604,6 +1610,7 @@ async def send_alert(target_msg: types.Message, currency: str, provider: str, la
             "currency": currency,
             "method": ", ".join(methods),
             "methods": methods,
+            "traffic_stopped": None if custom_texts else (template_key in ("stop", "short_stop")),
             "provider": provider,
             "label": label,
             "channels": list(channels),
@@ -2059,7 +2066,8 @@ async def method_resolve_channels_both(callback: types.CallbackQuery, state: FSM
     await run_method_resolve(callback, state, d["mr_selected"], list(CHANNEL_ORDER))
 
 
-async def run_method_resolve(callback: types.CallbackQuery, state: FSMContext, restored_methods: list, restored_channels: list):
+async def run_method_resolve(callback: types.CallbackQuery, state: FSMContext, restored_methods: list, restored_channels: list,
+                             traffic=None):
     """Восстановление по методам и каналам. Мерчант получает ОДНО сообщение только про то, что у него реально вернулось;
     остальное остаётся в просадке. Просадка закрывается, когда ограничений не осталось."""
     d = await state.get_data()
@@ -2073,6 +2081,11 @@ async def run_method_resolve(callback: types.CallbackQuery, state: FSMContext, r
     if not incident or not incident.get("messages"):
         await state.clear()
         return await callback.message.edit_text("❌ Ошибка: Инцидент уже закрыт.")
+
+    if traffic is None:
+        traffic = incident_traffic_stopped(incident)
+        if traffic is None:
+            return await ask_traffic(callback, state, incident, "methods", restored_methods, restored_channels)
 
     currency = incident["currency"]
     provider = incident.get("provider", "")
@@ -2112,7 +2125,7 @@ async def run_method_resolve(callback: types.CallbackQuery, state: FSMContext, r
         if not chat_id:
             chat_id, thread_id = parse_chat_id(cid_str)
 
-        text = render_method_resolve(lang, currency, provider, restored_pairs, new_pairs)
+        text = render_method_resolve(lang, currency, provider, restored_pairs, new_pairs, traffic_stopped=traffic)
         if tags:
             text += f"\n\n📌 **cc:** {' '.join(escape_md(t) for t in tags)}"
 
@@ -2167,7 +2180,7 @@ async def run_method_resolve(callback: types.CallbackQuery, state: FSMContext, r
     if warnings:
         status += f"\n\n⚠️ **Автоматически перенаправлено в General ({len(warnings)}):**\n" + "\n".join(warnings)
 
-    commit_incident_state(inc_id, incident, closed=not remaining_messages)
+    commit_incident_state(inc_id, incident, closed=not remaining_messages, extra={"traffic_stopped": traffic})
     await state.clear()
 
     for chunk_start in range(0, len(status), 3500):
@@ -2186,8 +2199,8 @@ OUTAGE_TEXTS = {
                   "{channels_on} ({currencies}).\n"
                   "🛑 **Просим временно приостановить трафик {channels_on} ({currencies}).**{unaffected}\n"
                   "О восстановлении сообщим дополнительно."),
-        "resolve": "✅ Коллеги, работа {restored} восстановлена, трафик можно возобновить.",
-        "resolve_partial": ("✅ Коллеги, работа {restored} восстановлена, трафик можно возобновить.\n"
+        "resolve": "✅ Коллеги, работа {restored} восстановлена{resume}.",
+        "resolve_partial": ("✅ Коллеги, работа {restored} восстановлена{resume}.\n"
                             "⚠️ Ограничения сохраняются: {remaining}. О восстановлении сообщим дополнительно."),
         "other_currencies": " По остальным валютам ограничений нет.",
     },
@@ -2196,12 +2209,31 @@ OUTAGE_TEXTS = {
                   "{channels_on} ({currencies}).\n"
                   "🛑 **Please temporarily pause traffic {channels_on} ({currencies}).**{unaffected}\n"
                   "We will notify you once resolved."),
-        "resolve": "✅ Colleagues, operations {restored} have been restored, traffic can be resumed.",
-        "resolve_partial": ("✅ Colleagues, operations {restored} have been restored, traffic can be resumed.\n"
+        "resolve": "✅ Colleagues, operations {restored} have been restored{resume}.",
+        "resolve_partial": ("✅ Colleagues, operations {restored} have been restored{resume}.\n"
                             "⚠️ Restrictions remain in place: {remaining}. We will notify you once resolved."),
         "other_currencies": " There are no restrictions on your other currencies.",
     },
 }
+
+
+# Фраза "трафик можно возобновить" пишется ТОЛЬКО если мерчантов просили приостановить трафик
+RESUME_PHRASES = {"RU": ", трафик можно возобновить", "EN": ", traffic can be resumed"}
+
+
+def incident_traffic_stopped(incident: dict):
+    """Просили ли мерчантов приостановить трафик: True / False / None (неизвестно - свой текст, спросим при восстановлении).
+    Для просадок, созданных прошлыми версиями, определяем по названию типа оповещения."""
+    if "traffic_stopped" in incident:
+        return incident["traffic_stopped"]
+    label = (incident.get("type_label") or "").casefold()
+    if "свой текст" in label:
+        return None
+    if "🛑" in label or "стоп" in label or "стандартный текст" in label:
+        return True
+    if label.startswith("⚠️"):
+        return False
+    return None
 
 
 def group_pairs(pairs: dict) -> list:
@@ -2257,13 +2289,14 @@ def render_outage_alert(lang: str, currencies_here: list, channels, has_other_cu
     )
 
 
-def render_outage_resolve(lang: str, restored_pairs: dict, remaining_pairs: dict) -> str:
+def render_outage_resolve(lang: str, restored_pairs: dict, remaining_pairs: dict, traffic_stopped: bool = True) -> str:
     lang = lang if lang in ("RU", "EN") else "RU"
     t = OUTAGE_TEXTS[lang]
     restored = outage_group_phrase(lang, restored_pairs, "on")
+    resume = RESUME_PHRASES[lang] if traffic_stopped else ""
     if remaining_pairs:
-        return t["resolve_partial"].format(restored=restored, remaining=outage_group_phrase(lang, remaining_pairs, "nom"))
-    return t["resolve"].format(restored=restored)
+        return t["resolve_partial"].format(restored=restored, resume=resume, remaining=outage_group_phrase(lang, remaining_pairs, "nom"))
+    return t["resolve"].format(restored=restored, resume=resume)
 
 
 def outage_message_text(info: dict, lang: str, currencies: list, channels, custom_texts=None) -> str:
@@ -2277,7 +2310,7 @@ def outage_message_text(info: dict, lang: str, currencies: list, channels, custo
     return render_outage_alert(lang, chat_curs, channels, has_other)
 
 
-def commit_incident_state(inc_id: int, incident: dict, closed: bool):
+def commit_incident_state(inc_id: int, incident: dict, closed: bool, extra: dict = None):
     """Сохраняет итог операции по просадке, не затирая то, что другие операторы изменили, пока шла рассылка
     (рассылка в десятки чатов занимает время - файл мог измениться: новые мерчанты, чужие оповещения)."""
     fresh = load_data()
@@ -2289,7 +2322,46 @@ def commit_incident_state(inc_id: int, incident: dict, closed: bool):
             target["messages"] = incident["messages"]
             if incident.get("kind") == "outage":
                 target["currency"] = incident.get("currency", target.get("currency"))
+            if extra:
+                target.update(extra)
     save_data(fresh)
+
+
+def unescape_md(text: str) -> str:
+    return re.sub(r"\\([\\_*`\[])", r"\1", text or "")
+
+
+async def ask_traffic(callback: types.CallbackQuery, state: FSMContext, incident: dict, kind: str, pending_a: list, pending_b: list):
+    """Для просадки со своим текстом неизвестно, просили ли останавливать трафик - спрашиваем перед отправкой восстановления,
+    чтобы не написать мерчантам 'можно возобновить', если они ничего не останавливали."""
+    await state.update_data(pending_kind=kind, pending_a=list(pending_a), pending_b=list(pending_b))
+    await state.set_state(ResolveState.asking_traffic)
+    sample = unescape_md(incident.get("text_ru") or "")
+    if len(sample) > 300:
+        sample = sample[:300] + "…"
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🛑 Да, трафик останавливали (напишем «можно возобновить»)", callback_data="trf_yes")],
+        [InlineKeyboardButton(text="▶️ Нет, трафик не останавливали", callback_data="trf_no")],
+        cancel_button_row()
+    ])
+    # без Markdown: внутри может быть чужой текст оповещения
+    await callback.message.edit_text(
+        "Вы просили мерчантов приостановить трафик? От этого зависит текст восстановления: "
+        "«трафик можно возобновить» пишем, только если его останавливали.\n\n"
+        f"Текст оповещения:\n{sample}",
+        reply_markup=kb
+    )
+
+
+@dp.callback_query(ResolveState.asking_traffic, F.data.in_({"trf_yes", "trf_no"}))
+async def answer_traffic(callback: types.CallbackQuery, state: FSMContext):
+    d = await state.get_data()
+    traffic = callback.data == "trf_yes"
+    await callback.answer()
+    if d.get("pending_kind") == "methods":
+        await run_method_resolve(callback, state, d["pending_a"], d["pending_b"], traffic=traffic)
+    else:
+        await run_outage_resolve(callback, state, d["pending_a"], d["pending_b"], traffic=traffic)
 
 
 def _grid3(buttons: list) -> list:
@@ -2641,6 +2713,7 @@ async def send_outage(target_msg: types.Message, d: dict):
         data["active_incidents"].append({
             "id": incident_id,
             "kind": "outage",
+            "traffic_stopped": None if custom_texts else True,
             "currency": ", ".join(currencies),
             "currencies": currencies,
             "provider": "",
@@ -2845,7 +2918,8 @@ async def outage_resolve_channels_both(callback: types.CallbackQuery, state: FSM
     await run_outage_resolve(callback, state, d["or_selected_currencies"], list(CHANNEL_ORDER))
 
 
-async def run_outage_resolve(callback: types.CallbackQuery, state: FSMContext, restored_currencies: list, restored_channels: list):
+async def run_outage_resolve(callback: types.CallbackQuery, state: FSMContext, restored_currencies: list, restored_channels: list,
+                             traffic=None):
     """Отправляет восстановление по выбранным валютам и каналам. Мерчант получает ОДНО сообщение только про то,
     что у него реально восстановилось; остальное остаётся в просадке. Просадка закрывается, когда ограничений не осталось."""
     d = await state.get_data()
@@ -2859,6 +2933,11 @@ async def run_outage_resolve(callback: types.CallbackQuery, state: FSMContext, r
     if not incident or not incident.get("messages"):
         await state.clear()
         return await callback.message.edit_text("❌ Ошибка: Инцидент уже закрыт.")
+
+    if traffic is None:
+        traffic = incident_traffic_stopped(incident)
+        if traffic is None:
+            return await ask_traffic(callback, state, incident, "outage", restored_currencies, restored_channels)
 
     resolved_count = partial_count = skipped_count = 0
     failed, warnings, remaining_messages = [], [], []
@@ -2895,7 +2974,7 @@ async def run_outage_resolve(callback: types.CallbackQuery, state: FSMContext, r
         if not chat_id:
             chat_id, thread_id = parse_chat_id(cid_str)
 
-        text = render_outage_resolve(lang, restored_pairs, new_pairs)
+        text = render_outage_resolve(lang, restored_pairs, new_pairs, traffic_stopped=traffic)
         if tags:
             text += f"\n\n📌 **cc:** {' '.join(escape_md(t) for t in tags)}"
 
@@ -2954,7 +3033,7 @@ async def run_outage_resolve(callback: types.CallbackQuery, state: FSMContext, r
     if warnings:
         status += f"\n\n⚠️ **Автоматически перенаправлено в General ({len(warnings)}):**\n" + "\n".join(warnings)
 
-    commit_incident_state(inc_id, incident, closed=not remaining_messages)
+    commit_incident_state(inc_id, incident, closed=not remaining_messages, extra={"traffic_stopped": traffic})
     await state.clear()
 
     for chunk_start in range(0, len(status), 3500):
