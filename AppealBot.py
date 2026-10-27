@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -154,20 +155,24 @@ TEMPLATES = {
     },
     # восстановление без каналов (старые просадки, созданные до появления каналов)
     "resolve": {
-        "RU": "✅ **[{curr}]{provider_part}** Коллеги, сервис работает в штатном режиме. Технические работы завершены.",
-        "EN": "✅ **[{curr}]{provider_part}** Colleagues, the service is fully operational. Maintenance resolved."
+        "RU": "✅ **[{curr}]{provider_part}** Коллеги, сервис работает в штатном режиме. Технические работы завершены.{resume}",
+        "EN": "✅ **[{curr}]{provider_part}** Colleagues, the service is fully operational. Maintenance resolved.{resume}"
     },
     # восстановление: все затронутые каналы восстановлены
     "resolve_channels": {
-        "RU": "✅ **[{curr}]{provider_part}** Коллеги, {restored}, сервис работает в штатном режиме. Технические работы завершены.",
-        "EN": "✅ **[{curr}]{provider_part}** Colleagues, {restored}, and the service is fully operational. Maintenance resolved."
+        "RU": "✅ **[{curr}]{provider_part}** Коллеги, {restored}, сервис работает в штатном режиме. Технические работы завершены.{resume}",
+        "EN": "✅ **[{curr}]{provider_part}** Colleagues, {restored}, and the service is fully operational. Maintenance resolved.{resume}"
     },
     # восстановление: вернулся один канал, по второму ограничения сохраняются
     "resolve_partial": {
-        "RU": "✅ **[{curr}]{provider_part}** Коллеги, {restored}.\n⚠️ Ограничения {remaining_on} сохраняются, о восстановлении сообщим дополнительно.",
-        "EN": "✅ **[{curr}]{provider_part}** Colleagues, {restored}.\n⚠️ Restrictions {remaining_on} remain in place; we will notify you once resolved."
+        "RU": "✅ **[{curr}]{provider_part}** Коллеги, {restored}.{resume_partial}\n⚠️ Ограничения {remaining_on} сохраняются, о восстановлении сообщим дополнительно.",
+        "EN": "✅ **[{curr}]{provider_part}** Colleagues, {restored}.{resume_partial}\n⚠️ Restrictions {remaining_on} remain in place; we will notify you once resolved."
     },
 }
+
+# фраза про возобновление трафика - только если мерчантов просили его остановить
+RESUME_SENTENCES = {"RU": " Можете возобновить трафик.", "EN": " You can resume traffic."}
+RESUME_PARTIAL_SENTENCES = {"RU": " Можете возобновить трафик {on}.", "EN": " You can resume traffic {on}."}
 
 TEMPLATES["resolve_methods"] = {
     "RU": "✅ **[{curr}]{provider_part}** Коллеги, работа {restored} восстановлена{resume}.",
@@ -305,11 +310,16 @@ def method_unaffected(lang: str, currency: str, methods) -> str:
 
 
 def render_template(key: str, lang: str, currency: str, provider: str, channels=None, restored=None, remaining=None,
-                    methods=None) -> str:
+                    methods=None, traffic_stopped=None) -> str:
     """Собирает текст для мерчанта из шаблона: валюта (и методы), банк в скобках (если указан), каналы."""
     lang = lang if lang in ("RU", "EN") else "RU"
     unaffected = channel_phrase(lang, "unaffected", channels) + method_unaffected(lang, currency, methods)
+    resume = RESUME_SENTENCES[lang] if traffic_stopped else ""
+    resume_partial = (RESUME_PARTIAL_SENTENCES[lang].format(on=channel_phrase(lang, "on", restored))
+                      if traffic_stopped and restored else "")
     return TEMPLATES[key][lang].format(
+        resume=resume,
+        resume_partial=resume_partial,
         curr=escape_md(curr_display(currency, methods)),
         provider_part=provider_part(provider),
         channels_on=channel_phrase(lang, "on", channels),
@@ -441,6 +451,42 @@ def notified_merchants(incident: dict, chats_registry: dict) -> list:
     return result
 
 
+def incident_chat_status(incident: dict, chats_registry: dict, names: list):
+    """Делит оповещённых мерчантов на тех, кто ещё в просадке (с остатком каналов/валют), и на уже восстановленных.
+    Возвращает (active, restored, partial): active - список строк, restored - список имён, partial - есть ли частичное восстановление."""
+    initial_ch = normalize_channels(incident.get("channels"))
+    active = []
+    active_names = []
+    partial = False
+    for m in incident.get("messages", []):
+        name = m.get("name")
+        if not name:
+            cid = str(m.get("chat_key", m.get("chat_id")))
+            name = chats_registry.get(cid, {}).get("name", cid)
+        active_names.append(name)
+        detail = ""
+        pairs = m.get("pairs")
+        if pairs:
+            if len(pairs) <= 4:
+                detail = ", ".join(f"{k} {channel_icons(v)}".strip() for k, v in pairs.items())
+            else:
+                detail = f"{len(pairs)} вал./метод."
+        elif m.get("channels") and initial_ch and normalize_channels(m.get("channels")) != initial_ch:
+            detail = channel_icons(m.get("channels"))
+            partial = True
+        active.append(escape_md(name) + (f" ({escape_md(detail)})" if detail else ""))
+    remaining = {}
+    for n in active_names:
+        remaining[n] = remaining.get(n, 0) + 1
+    restored = []
+    for n in names:
+        if remaining.get(n, 0) > 0:
+            remaining[n] -= 1
+        else:
+            restored.append(n)
+    return active, restored, partial
+
+
 def build_incident_details(incident: dict, chats_registry: dict) -> str:
     """Текст карточки '🔍 Подробнее': название, валюта/метод, каналы, время, мерчанты, тип и сам текст оповещения."""
     is_outage = incident.get("kind") == "outage"
@@ -485,8 +531,19 @@ def build_incident_details(incident: dict, chats_registry: dict) -> str:
     shown = ", ".join(escape_md(n) for n in names[:limit])
     if len(names) > limit:
         shown += f" и ещё {len(names) - limit}"
-    lines.append(f"Оповещены ({len(names)}): {shown if shown else '—'}")
-    lines.append(f"Сейчас активна в: **{len(incident.get('messages', []))}** чат(ах)")
+    active_items, restored_names, partial = incident_chat_status(incident, chats_registry, names)
+    if restored_names or partial:
+        # часть мерчантов уже восстановлена - показываем отдельно, кто ещё в просадке, а кто нет
+        def _cut(items):
+            out = ", ".join(items[:limit])
+            return out + (f" и ещё {len(items) - limit}" if len(items) > limit else "")
+        lines.append(f"Оповещено при создании: **{len(names)}**")
+        lines.append(f"🔴 Сейчас в просадке (**{len(active_items)}**): {_cut(active_items) if active_items else '—'}")
+        if restored_names:
+            lines.append(f"✅ Уже восстановлены (**{len(restored_names)}**): {_cut([escape_md(n) for n in restored_names])}")
+    else:
+        lines.append(f"Оповещены ({len(names)}): {shown if shown else '—'}")
+        lines.append(f"Сейчас активна в: **{len(incident.get('messages', []))}** чат(ах)")
 
     if is_methods:
         lines.append("Активно сейчас по методам:")
@@ -784,6 +841,8 @@ async def cmd_add_chat(message: types.Message):
 
         data = load_data()
         known_currencies = set(get_currency_list(data))  # какие кнопки валют были до этого мерчанта
+        dup_keys = [k for k, v in data["chats"].items()
+                    if k != chat_key and (v.get("chat_id"), v.get("thread_id")) == (chat_id, thread_id)]
         new_currencies = [c for c in currencies if c not in known_currencies]
         data["chats"][chat_key] = {
             "chat_id": chat_id,
@@ -808,6 +867,11 @@ async def cmd_add_chat(message: types.Message):
             answer_text += (
                 f"\n\n🆕 Новая валюта: **{', '.join(new_currencies)}** — кнопка появится автоматически. "
                 "Если это опечатка, отправьте /add_chat для этого чата ещё раз с верным кодом."
+            )
+        if dup_keys:
+            answer_text += (
+                f"\n\n⚠️ Этот чат уже записан под другим ключом: {', '.join('`' + k + '`' for k in dup_keys)}. "
+                "Мерчант получал бы сообщения дважды - удалите лишнюю запись командой /del_chat."
             )
         await message.answer(answer_text, parse_mode="Markdown")
     except Exception:
@@ -969,6 +1033,13 @@ async def cmd_list_chats(message: types.Message):
         safe_name = escape_md(info['name'])
         text += f"• `{cid}` | **{safe_name}** | [{info.get('lang', 'RU')}] | Валюты: {', '.join(info['currencies'])}{tags_str}\n"
 
+    dups = find_duplicate_chats(chats)
+    if dups:
+        text += "\n⚠️ **Дубли: один и тот же чат записан несколько раз (мерчант получает сообщения по нескольку раз):**\n"
+        for keys in dups:
+            text += "• " + ", ".join(f"`{k}`" for k in keys) + "\n"
+        text += "Лишнюю запись удалите командой /del_chat с её ключом.\n"
+
     for chunk_start in range(0, len(text), 3500):
         await message.answer(text[chunk_start:chunk_start + 3500], parse_mode="Markdown")
 
@@ -1036,7 +1107,7 @@ async def cmd_force_resolve(message: types.Message):
     if len(args) < 2:
         return await message.answer(
             "⚠️ Формат: `/force_resolve <inc_id> <chat_id>`\n"
-            "Узнать inc_id и chat_id можно из сообщения «📊 Показать имеющиеся просадки» "
+            "Узнать inc_id и chat_id можно в «📊 Показать имеющиеся просадки» (валюта → «Оповещения») "
             "или из отчёта об ошибке отправки (там chat_id уже указан).",
             parse_mode="Markdown"
         )
@@ -1095,7 +1166,7 @@ async def cmd_delete_alert(message: types.Message):
     if not args:
         return await message.answer(
             "⚠️ Формат: `/delete_alert <inc_id>`\n"
-            "inc_id возьми из «📊 Показать имеющиеся просадки».\n"
+            "inc_id возьми в «📊 Показать имеющиеся просадки» (валюта → «Оповещения»).\n"
             "⚠️ Удалит сообщение ВО ВСЕХ чатах этого инцидента без возможности отмены.",
             parse_mode="Markdown"
         )
@@ -1418,6 +1489,7 @@ async def finish_channel_selection(callback: types.CallbackQuery, state: FSMCont
 
     await callback.answer()
     await send_alert(
+        edit_target=True,
         target_msg=callback.message,
         currency=user_data["selected_currency"],
         provider=user_data["provider"],
@@ -1531,8 +1603,32 @@ async def send_with_thread_fallback(chat_id, thread_id, text, reply_to_message_i
         return msg, None, True
 
 
-async def send_alert(target_msg: types.Message, currency: str, provider: str, label: str, target_chats: dict, selected_chat_ids: list,
-                     template_key: str = None, custom_texts: dict = None, channels: list = None, methods: list = None):
+async def send_alert(*args, edit_target: bool = False, **kwargs):
+    target_msg = kwargs.get("target_msg") or args[0]
+    key = ("alert", target_msg.chat.id)
+    if not try_lock(key):
+        return await target_msg.answer("⏳ Оповещение уже отправляется - повторное нажатие проигнорировано.")
+    try:
+        fp = alert_fingerprint(kwargs)
+        dup = find_recent_duplicate(fp)
+        if dup:
+            inc, age = dup
+            return await target_msg.answer(
+                f"⚠️ Точно такое же оповещение (просадка id {inc['id']}) уже отправлено {age} сек. назад - второй раз не отправляю, "
+                "чтобы мерчантам не пришло дважды.\n"
+                "Если это не случайный повтор, измените название или повторите через пару минут.")
+        n = len(kwargs.get("selected_chat_ids") or [])
+        progress = await start_progress(
+            target_msg, f"⏳ Отправляю оповещение в {n} чат(ов)...\nПодождите и не нажимайте кнопки повторно - отчёт появится здесь.",
+            edit_target)
+        return await _send_alert(*args, progress_msg=progress, fingerprint=fp, **kwargs)
+    finally:
+        unlock(key)
+
+
+async def _send_alert(target_msg: types.Message, currency: str, provider: str, label: str, target_chats: dict, selected_chat_ids: list,
+                     template_key: str = None, custom_texts: dict = None, channels: list = None, methods: list = None,
+                     progress_msg=None, fingerprint: str = None):
     data = load_data()
     channels = normalize_channels(channels)
     methods = normalize_methods(methods, currency)
@@ -1540,6 +1636,7 @@ async def send_alert(target_msg: types.Message, currency: str, provider: str, la
     failed = []
     warnings = []
     selected_chat_ids_str = [str(x) for x in selected_chat_ids]
+    seen_targets = set()  # куда уже отправили в этой рассылке (защита от дубля записи одного чата в базе)
 
     # базовый текст (без тегов cc, которые у каждого чата свои) - для отображения в "🔍 Подробнее"
     if custom_texts:
@@ -1563,6 +1660,10 @@ async def send_alert(target_msg: types.Message, currency: str, provider: str, la
         if not chat_id:
             chat_id, thread_id = parse_chat_id(cid_str)
 
+        if (chat_id, thread_id) in seen_targets:
+            failed.append(f"• `{cid_str}` ({escape_md(name)}): дубль - этот чат уже получил сообщение (записан в базе несколько раз)")
+            continue
+
         if custom_texts:
             # берём версию под язык конкретного чата; если её нет - используем RU как запасной вариант
             raw_text = custom_texts.get(lang, custom_texts.get("RU", ""))
@@ -1577,6 +1678,8 @@ async def send_alert(target_msg: types.Message, currency: str, provider: str, la
         fell_back_note = ""
         try:
             msg, used_thread_id, fell_back = await send_with_thread_fallback(chat_id, thread_id, alert_text)
+            seen_targets.add((chat_id, thread_id))
+            seen_targets.add((chat_id, used_thread_id))
             if fell_back:
                 fell_back_note = "ветка недоступна, сообщение ушло в General"
             item = {
@@ -1611,6 +1714,7 @@ async def send_alert(target_msg: types.Message, currency: str, provider: str, la
             "method": ", ".join(methods),
             "methods": methods,
             "traffic_stopped": None if custom_texts else (template_key in ("stop", "short_stop")),
+            "fingerprint": fingerprint,
             "provider": provider,
             "label": label,
             "channels": list(channels),
@@ -1632,8 +1736,7 @@ async def send_alert(target_msg: types.Message, currency: str, provider: str, la
     if failed:
         report += f"\n\n❌ **Не отправлено в {len(failed)} чат(ов):**\n" + "\n".join(failed)
 
-    for chunk_start in range(0, len(report), 3500):
-        await target_msg.answer(report[chunk_start:chunk_start + 3500], parse_mode="Markdown")
+    await send_report(target_msg, progress_msg, report)
 
 
 # ------------------- ХЕНДЛЕР 2: ВОССТАНОВЛЕНИЕ С ВЫБОРОМ ИНЦИДЕНТА -------------------
@@ -1648,8 +1751,11 @@ async def resolve_incident_start(message: types.Message):
     if not active:
         return await message.answer("🟢 На данный момент нет активных просадок.")
 
+    hidden = hidden_duplicate_incidents(active)
     buttons = []
     for inc in active:
+        if inc["id"] in hidden:
+            continue
         label = inc.get("label") or inc.get("provider") or "без названия"
         chat_count = len(inc.get("messages", []))
         icons = channel_icons(active_channels(inc))
@@ -1661,7 +1767,10 @@ async def resolve_incident_start(message: types.Message):
         buttons.append([InlineKeyboardButton(text=btn_text, callback_data=f"resolveinc_{inc['id']}")])
 
     kb = InlineKeyboardMarkup(inline_keyboard=buttons + [cancel_button_row()])
-    await message.answer("Выберите конкретную просадку для восстановления:", reply_markup=kb)
+    text = "Выберите конкретную просадку для восстановления:"
+    if hidden:
+        text += f"\n\nℹ️ Скрыто дублирующих оповещений: {len(hidden)} - все их мерчанты уже есть в более важном оповещении (со стопом трафика) и закроются вместе с ним."
+    await message.answer(text, reply_markup=kb)
 
 
 @dp.callback_query(F.data.startswith("resolveinc_"))
@@ -1811,7 +1920,18 @@ async def resolve_all_channels(callback: types.CallbackQuery, state: FSMContext)
     await run_resolve(callback, state, restored=available)
 
 
-async def run_resolve(callback: types.CallbackQuery, state: FSMContext, restored: list):
+async def run_resolve(callback: types.CallbackQuery, state: FSMContext, restored: list, traffic=None):
+    d = await state.get_data()
+    key = ("resolve", d.get("resolve_inc_id"))
+    if not try_lock(key):
+        return await callback.answer("⏳ Восстановление уже отправляется, подождите.", show_alert=True)
+    try:
+        return await _run_resolve(callback, state, restored, traffic)
+    finally:
+        unlock(key)
+
+
+async def _run_resolve(callback: types.CallbackQuery, state: FSMContext, restored: list, traffic=None):
     """Отправляет сообщения о восстановлении в выбранные чаты. restored - какие каналы восстановились
     (пусто - старая просадка без каналов). Если в чате остался невосстановленный канал, чат остаётся
     в просадке только с этим каналом."""
@@ -1827,15 +1947,23 @@ async def run_resolve(callback: types.CallbackQuery, state: FSMContext, restored
         await state.clear()
         return await callback.message.edit_text("❌ Ошибка: Инцидент уже закрыт.")
 
+    if traffic is None:
+        traffic = incident_traffic_stopped(incident)
+        if traffic is None:
+            return await ask_traffic(callback, state, incident, "channels", list(restored), [])
+
+    await show_resolve_progress(callback, incident, selected_resolve_ids)
     resolved_count = 0
     partial_count = 0
     skipped_count = 0
     failed = []
     warnings = []
     remaining_messages = []
+    restored_map = {}
     currency = incident["currency"]
     provider = incident["provider"]
     label = incident.get("label") or provider or "без названия"
+    snapshot = load_data()
 
     for item in incident["messages"]:
         cid_str = str(item.get("chat_key", item["chat_id"]))
@@ -1867,8 +1995,10 @@ async def run_resolve(callback: types.CallbackQuery, state: FSMContext, restored
         if not chat_id:
             chat_id, thread_id = parse_chat_id(cid_str)
 
+        # если в соседнем оповещении этой валюты мерчанта просили остановить трафик - пишем «можно возобновить»
+        traffic_here = True if (traffic is not True and dup_traffic_stop(snapshot, currency, inc_id, cid_str)) else traffic
         resolve_text = render_template(template_key, lang, currency, provider, restored=restored_here, remaining=remaining_here,
-                                       methods=incident_methods(incident))
+                                       methods=incident_methods(incident), traffic_stopped=traffic_here)
         if tags:
             safe_tags = [escape_md(t) for t in tags]
             resolve_text += f"\n\n📌 **cc:** {' '.join(safe_tags)}"
@@ -1892,6 +2022,7 @@ async def run_resolve(callback: types.CallbackQuery, state: FSMContext, restored
             continue
 
         resolved_count += 1
+        restored_map[cid_str] = set(restored_here) if item_channels else None
         if fell_back:
             warnings.append(f"• `{cid_str}` ({escape_md(name)}): ветка недоступна, ушло в General")
         if remaining_here:
@@ -1921,7 +2052,14 @@ async def run_resolve(callback: types.CallbackQuery, state: FSMContext, restored
     if warnings:
         status_msg += f"\n\n⚠️ **Автоматически перенаправлено в General ({len(warnings)}):**\n" + "\n".join(warnings)
 
-    commit_incident_state(inc_id, incident, closed=not remaining_messages)
+    commit_incident_state(inc_id, incident, closed=not remaining_messages, extra={"traffic_stopped": traffic})
+    swept = sweep_duplicate_restores(currency, inc_id, restored_map)
+    if swept:
+        parts = []
+        for sid, names, closed in swept:
+            shown = ", ".join(escape_md(n) for n in names[:10]) + (f" и ещё {len(names) - 10}" if len(names) > 10 else "")
+            parts.append(f"• id {sid}: {shown}" + (" - оповещение закрыто" if closed else ""))
+        status_msg += "\n\n🧹 **Заодно убрал из других оповещений этой валюты** (повторных сообщений им не отправлял):\n" + "\n".join(parts)
     await state.clear()
 
     for chunk_start in range(0, len(status_msg), 3500):
@@ -2068,6 +2206,18 @@ async def method_resolve_channels_both(callback: types.CallbackQuery, state: FSM
 
 async def run_method_resolve(callback: types.CallbackQuery, state: FSMContext, restored_methods: list, restored_channels: list,
                              traffic=None):
+    d = await state.get_data()
+    key = ("resolve", d.get("resolve_inc_id"))
+    if not try_lock(key):
+        return await callback.answer("⏳ Восстановление уже отправляется, подождите.", show_alert=True)
+    try:
+        return await _run_method_resolve(callback, state, restored_methods, restored_channels, traffic)
+    finally:
+        unlock(key)
+
+
+async def _run_method_resolve(callback: types.CallbackQuery, state: FSMContext, restored_methods: list, restored_channels: list,
+                              traffic=None):
     """Восстановление по методам и каналам. Мерчант получает ОДНО сообщение только про то, что у него реально вернулось;
     остальное остаётся в просадке. Просадка закрывается, когда ограничений не осталось."""
     d = await state.get_data()
@@ -2087,6 +2237,7 @@ async def run_method_resolve(callback: types.CallbackQuery, state: FSMContext, r
         if traffic is None:
             return await ask_traffic(callback, state, incident, "methods", restored_methods, restored_channels)
 
+    await show_resolve_progress(callback, incident, selected_ids)
     currency = incident["currency"]
     provider = incident.get("provider", "")
     resolved_count = partial_count = skipped_count = 0
@@ -2310,6 +2461,92 @@ def outage_message_text(info: dict, lang: str, currencies: list, channels, custo
     return render_outage_alert(lang, chat_curs, channels, has_other)
 
 
+def _traffic_rank(incident: dict) -> int:
+    """Важность оповещения: со стопом трафика (2) > свой текст/неизвестно (1) > без стопа (0)."""
+    t = incident_traffic_stopped(incident)
+    return 2 if t is True else (1 if t is None else 0)
+
+
+def hidden_duplicate_incidents(active: list) -> dict:
+    """{id скрываемого оповещения: id основного}. Оповещение скрываем из списка восстановления, если ВСЕ его мерчанты
+    (с теми же каналами) уже есть в более важном оповещении той же валюты: восстановив основное, закроем и его."""
+    plain = [i for i in active if i.get("kind") != "outage" and not has_method_pairs(i) and i.get("messages")]
+    allch = set(CHANNEL_ORDER)
+
+    def cover(inc):
+        out = {}
+        for m in inc["messages"]:
+            out[str(m.get("chat_key", m.get("chat_id")))] = set(normalize_channels(m.get("channels"))) or set(allch)
+        return out
+
+    covers = {i["id"]: cover(i) for i in plain}
+    hidden = {}
+    for o in plain:
+        for p in plain:
+            if p["id"] == o["id"] or p["id"] in hidden or p.get("currency") != o.get("currency"):
+                continue
+            if (_traffic_rank(p), p["id"]) <= (_traffic_rank(o), o["id"]):
+                continue
+            pc = covers[p["id"]]
+            if all(k in pc and chs <= pc[k] for k, chs in covers[o["id"]].items()):
+                hidden[o["id"]] = p["id"]
+                break
+    return hidden
+
+
+def dup_traffic_stop(data: dict, currency: str, source_id: int, chat_key: str) -> bool:
+    """True, если этого мерчанта в другой активной обычной просадке той же валюты просили остановить трафик."""
+    for o in data.get("active_incidents", []):
+        if o["id"] == source_id or o.get("kind") == "outage" or o.get("currency") != currency or has_method_pairs(o):
+            continue
+        if incident_traffic_stopped(o) is True and any(str(m.get("chat_key", m.get("chat_id"))) == chat_key for m in o.get("messages", [])):
+            return True
+    return False
+
+
+def sweep_duplicate_restores(currency: str, source_id: int, restored_map: dict) -> list:
+    """Мерчант восстановлен - убираем его (и восстановленные каналы) из ДРУГИХ активных обычных просадок этой валюты,
+    без уведомления чатов (сообщение о восстановлении он уже получил). restored_map: {chat_key: set(каналов) | None (все)}.
+    Возвращает [(id просадки, [имена убранных], закрыта ли)]."""
+    if not restored_map:
+        return []
+    fresh = load_data()
+    report, changed = [], False
+    for o in list(fresh.get("active_incidents", [])):
+        if o["id"] == source_id or o.get("kind") == "outage" or o.get("currency") != currency or has_method_pairs(o):
+            continue
+        kept, removed = [], []
+        for m in o.get("messages", []):
+            key = str(m.get("chat_key", m.get("chat_id")))
+            if key not in restored_map:
+                kept.append(m)
+                continue
+            rest = restored_map[key]
+            have = normalize_channels(m.get("channels"))
+            name = m.get("name") or fresh.get("chats", {}).get(key, {}).get("name", key)
+            if rest is None or not have:
+                removed.append(name)
+                continue
+            left = [c for c in have if c not in rest]
+            if left:
+                m["channels"] = left
+                kept.append(m)
+                if len(left) != len(have):
+                    changed = True
+            else:
+                removed.append(name)
+        if removed:
+            changed = True
+            o["messages"] = kept
+            closed = not kept
+            if closed:
+                fresh["active_incidents"] = [x for x in fresh["active_incidents"] if x["id"] != o["id"]]
+            report.append((o["id"], removed, closed))
+    if changed:
+        save_data(fresh)
+    return report
+
+
 def commit_incident_state(inc_id: int, incident: dict, closed: bool, extra: dict = None):
     """Сохраняет итог операции по просадке, не затирая то, что другие операторы изменили, пока шла рассылка
     (рассылка в десятки чатов занимает время - файл мог измениться: новые мерчанты, чужие оповещения)."""
@@ -2360,8 +2597,113 @@ async def answer_traffic(callback: types.CallbackQuery, state: FSMContext):
     await callback.answer()
     if d.get("pending_kind") == "methods":
         await run_method_resolve(callback, state, d["pending_a"], d["pending_b"], traffic=traffic)
+    elif d.get("pending_kind") == "channels":
+        await run_resolve(callback, state, d["pending_a"], traffic=traffic)
     else:
         await run_outage_resolve(callback, state, d["pending_a"], d["pending_b"], traffic=traffic)
+
+
+# Защита от повторного запуска: пока рассылка идёт (десятки секунд), повторное нажатие той же кнопки
+# (двойной тап, "не отвечает - нажму ещё раз") не должно запускать вторую такую же рассылку.
+BUSY = set()
+
+
+def try_lock(key) -> bool:
+    if key in BUSY:
+        return False
+    BUSY.add(key)
+    return True
+
+
+def unlock(key):
+    BUSY.discard(key)
+
+
+DUP_WINDOW_SEC = 120  # столько секунд точно такое же оповещение считается случайным повтором
+
+
+def make_fingerprint(*parts) -> str:
+    raw = json.dumps(parts, ensure_ascii=False, sort_keys=True, default=str)
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def alert_fingerprint(kw: dict) -> str:
+    """'Отпечаток' обычного оповещения: валюта, название, тип/текст, каналы, методы и набор чатов."""
+    ct = kw.get("custom_texts") or {}
+    return make_fingerprint(
+        "alert", kw.get("currency"), kw.get("label") or kw.get("provider"), kw.get("provider"),
+        kw.get("template_key") or "custom", sorted(normalize_channels(kw.get("channels"))),
+        sorted(kw.get("methods") or []), sorted(str(x) for x in (kw.get("selected_chat_ids") or [])),
+        ct.get("RU"), ct.get("EN"))
+
+
+def outage_fingerprint(d: dict) -> str:
+    return make_fingerprint(
+        "outage", sorted(d.get("out_selected") or []), sorted(normalize_channels(d.get("out_channels"))),
+        sorted(str(x) for x in (d.get("out_selected_chat_ids") or [])), d.get("out_type"),
+        d.get("out_custom_ru"), d.get("out_custom_en"))
+
+
+def find_recent_duplicate(fp: str):
+    """Нашлась ли просадка с таким же отпечатком, созданная меньше DUP_WINDOW_SEC назад: (просадка, возраст в секундах) или None."""
+    now = datetime.now(timezone.utc)
+    for inc in load_data().get("active_incidents", []):
+        if inc.get("fingerprint") != fp:
+            continue
+        try:
+            age = (now - datetime.fromisoformat(inc.get("created_at"))).total_seconds()
+        except Exception:
+            continue
+        if 0 <= age <= DUP_WINDOW_SEC:
+            return inc, int(age)
+    return None
+
+
+async def show_resolve_progress(callback, incident: dict, selected_ids):
+    """Сразу после нажатия кнопки восстановления окно превращается в 'идёт отправка' - кнопки исчезают, повторно жать нечего.
+    Потом это же окно правится на итог."""
+    sel = {str(x) for x in selected_ids}
+    n = sum(1 for m in incident.get("messages", []) if str(m.get("chat_key", m.get("chat_id"))) in sel)
+    await start_progress(callback.message, f"⏳ Отправляю восстановление в {n} чат(ов)... Подождите и не нажимайте кнопки повторно.", True)
+
+
+async def start_progress(target_msg, text: str, edit_target: bool):
+    """Сразу показывает 'идёт отправка'. Для сообщения бота (с кнопкой) - правит его, кнопка исчезает и повторно её не нажать;
+    иначе (оператор прислал текст) - отвечает новым сообщением. Это же сообщение потом превращается в отчёт."""
+    try:
+        if edit_target:
+            await target_msg.edit_text(text)
+            return target_msg
+        return await target_msg.answer(text)
+    except Exception:
+        return None
+
+
+async def send_report(target_msg, progress_msg, report: str):
+    """Первый кусок отчёта заменяет сообщение 'идёт отправка', остальные кусочки (если отчёт длинный) идут новыми сообщениями."""
+    for idx, start in enumerate(range(0, len(report), 3500)):
+        chunk = report[start:start + 3500]
+        if idx == 0 and progress_msg is not None:
+            try:
+                # правим напрямую через бота: не зависит от того, привязан ли объект сообщения к боту
+                await bot.edit_message_text(chunk, chat_id=progress_msg.chat.id, message_id=progress_msg.message_id,
+                                            parse_mode="Markdown")
+                continue
+            except Exception:
+                pass
+        await target_msg.answer(chunk, parse_mode="Markdown")
+
+
+def find_duplicate_chats(chats: dict) -> list:
+    """Группы ключей, которые указывают на один и тот же чат (и ветку): мерчант получал бы сообщения по нескольку раз."""
+    groups = {}
+    for key, info in chats.items():
+        chat_id = info.get("chat_id")
+        thread_id = info.get("thread_id")
+        if not chat_id:
+            chat_id, thread_id = parse_chat_id(key)
+        groups.setdefault((chat_id, thread_id), []).append(key)
+    return [keys for keys in groups.values() if len(keys) > 1]
 
 
 def _grid3(buttons: list) -> list:
@@ -2654,6 +2996,25 @@ async def outage_custom_en(message: types.Message, state: FSMContext):
 
 
 async def send_outage(target_msg: types.Message, d: dict):
+    key = ("alert", target_msg.chat.id)
+    if not try_lock(key):
+        return await target_msg.answer("⏳ Оповещение уже отправляется - повторное нажатие проигнорировано.")
+    try:
+        fp = outage_fingerprint(d)
+        dup = find_recent_duplicate(fp)
+        if dup:
+            inc, age = dup
+            return await target_msg.answer(
+                f"⚠️ Точно такой же сбой (просадка id {inc['id']}) уже отправлен {age} сек. назад - второй раз не отправляю, "
+                "чтобы мерчантам не пришло дважды.\n"
+                "Если это не случайный повтор, повторите через пару минут.")
+        # экран 'идёт отправка' уже показал обработчик кнопки - его же потом превращаем в отчёт
+        return await _send_outage(target_msg, d, progress_msg=target_msg, fingerprint=fp)
+    finally:
+        unlock(key)
+
+
+async def _send_outage(target_msg: types.Message, d: dict, progress_msg=None, fingerprint: str = None):
     """Рассылка сбоя: каждый мерчант получает ОДНО сообщение со своими валютами. Создаёт одну просадку (kind=outage)."""
     data = load_data()
     currencies = list(d["out_selected"])
@@ -2665,6 +3026,7 @@ async def send_outage(target_msg: types.Message, d: dict):
         custom_texts = {"RU": d.get("out_custom_ru", ""), "EN": d.get("out_custom_en", d.get("out_custom_ru", ""))}
 
     sent, failed, warnings = [], [], []
+    seen_targets = set()  # куда уже отправили в этой рассылке (защита от дубля записи одного чата в базе)
 
     for cid_str in ids:
         info = target.get(cid_str, {})
@@ -2679,6 +3041,10 @@ async def send_outage(target_msg: types.Message, d: dict):
         if not chat_id:
             chat_id, thread_id = parse_chat_id(cid_str)
 
+        if (chat_id, thread_id) in seen_targets:
+            failed.append(f"• `{cid_str}` ({escape_md(name)}): дубль - этот чат уже получил сообщение (записан в базе несколько раз)")
+            continue
+
         text = outage_message_text(info, lang, currencies, channels, custom_texts)
         tags = info.get("tags", [])
         if tags:
@@ -2686,6 +3052,8 @@ async def send_outage(target_msg: types.Message, d: dict):
 
         try:
             msg, used_thread_id, fell_back = await send_with_thread_fallback(chat_id, thread_id, text)
+            seen_targets.add((chat_id, thread_id))
+            seen_targets.add((chat_id, used_thread_id))
             sent.append({
                 "chat_key": cid_str, "chat_id": chat_id, "thread_id": used_thread_id, "message_id": msg.message_id,
                 "lang": lang, "name": name, "pairs": {c: list(channels) for c in chat_curs}
@@ -2713,6 +3081,7 @@ async def send_outage(target_msg: types.Message, d: dict):
         data["active_incidents"].append({
             "id": incident_id,
             "kind": "outage",
+            "fingerprint": fingerprint,
             "traffic_stopped": None if custom_texts else True,
             "currency": ", ".join(currencies),
             "currencies": currencies,
@@ -2737,8 +3106,7 @@ async def send_outage(target_msg: types.Message, d: dict):
     if failed:
         report += f"\n\n❌ **Не отправлено в {len(failed)} чат(ов):**\n" + "\n".join(failed)
 
-    for chunk_start in range(0, len(report), 3500):
-        await target_msg.answer(report[chunk_start:chunk_start + 3500], parse_mode="Markdown")
+    await send_report(target_msg, progress_msg, report)
 
 
 @dp.callback_query(OutageState.confirming, F.data == "outsend")
@@ -2920,6 +3288,18 @@ async def outage_resolve_channels_both(callback: types.CallbackQuery, state: FSM
 
 async def run_outage_resolve(callback: types.CallbackQuery, state: FSMContext, restored_currencies: list, restored_channels: list,
                              traffic=None):
+    d = await state.get_data()
+    key = ("resolve", d.get("resolve_inc_id"))
+    if not try_lock(key):
+        return await callback.answer("⏳ Восстановление уже отправляется, подождите.", show_alert=True)
+    try:
+        return await _run_outage_resolve(callback, state, restored_currencies, restored_channels, traffic)
+    finally:
+        unlock(key)
+
+
+async def _run_outage_resolve(callback: types.CallbackQuery, state: FSMContext, restored_currencies: list, restored_channels: list,
+                              traffic=None):
     """Отправляет восстановление по выбранным валютам и каналам. Мерчант получает ОДНО сообщение только про то,
     что у него реально восстановилось; остальное остаётся в просадке. Просадка закрывается, когда ограничений не осталось."""
     d = await state.get_data()
@@ -2939,6 +3319,7 @@ async def run_outage_resolve(callback: types.CallbackQuery, state: FSMContext, r
         if traffic is None:
             return await ask_traffic(callback, state, incident, "outage", restored_currencies, restored_channels)
 
+    await show_resolve_progress(callback, incident, selected_ids)
     resolved_count = partial_count = skipped_count = 0
     failed, warnings, remaining_messages = [], [], []
 
@@ -3044,35 +3425,268 @@ async def run_outage_resolve(callback: types.CallbackQuery, state: FSMContext, r
 
 
 # ------------------- ХЕНДЛЕР 3: ПОКАЗАТЬ ИМЕЮЩИЕСЯ ПРОСАДКИ -------------------
+# Просадки одной валюты (хоть десять оповещений по разным мерчантам) показываются ОДНОЙ строкой.
+# Сами записи остаются отдельными (у каждой свой текст/каналы/тип, на них завязано восстановление),
+# а на экране они собираются в сводку по валюте.
+GEO_LIST_LIMIT = 30  # сколько имён показывать в одной строке сводки, дальше "и ещё N"
+
+
+def short_since(iso) -> str:
+    """'08:02' если сегодня, иначе '19.10 08:02'. Пусто, если время неизвестно (старая просадка)."""
+    if not iso:
+        return ""
+    try:
+        dt = datetime.fromisoformat(iso).astimezone(LOCAL_TZ)
+    except Exception:
+        return ""
+    today = datetime.now(timezone.utc).astimezone(LOCAL_TZ).date()
+    return dt.strftime("%H:%M") if dt.date() == today else dt.strftime("%d.%m %H:%M")
+
+
+def group_active_incidents(active: list):
+    """({валюта: [просадки по возрастанию id]}, [сбои на площадке])."""
+    geos, outages = {}, []
+    for inc in active:
+        if inc.get("kind") == "outage":
+            outages.append(inc)
+        else:
+            geos.setdefault(inc.get("currency") or "?", []).append(inc)
+    for incs in geos.values():
+        incs.sort(key=lambda x: x["id"])
+    return geos, outages
+
+
+def _merge_traffic(a, b):
+    """Просили ли остановить трафик, если мерчант в нескольких оповещениях: да > неизвестно > нет."""
+    if a is True or b is True:
+        return True
+    if a is None or b is None:
+        return None
+    return False
+
+
+def geo_merchants(incs: list, chats: dict) -> dict:
+    """Мерчанты валюты из ВСЕХ её активных оповещений: {chat_key: {name, traffic, channels, methods}}."""
+    out = {}
+    for inc in incs:
+        traffic = incident_traffic_stopped(inc)
+        for m in inc.get("messages", []):
+            key = str(m.get("chat_key", m.get("chat_id")))
+            name = m.get("name") or chats.get(key, {}).get("name", key)
+            if key not in out:
+                out[key] = {"name": name, "traffic": traffic, "channels": set(), "methods": []}
+            else:
+                out[key]["traffic"] = _merge_traffic(out[key]["traffic"], traffic)
+            rec = out[key]
+            pairs = m.get("pairs") or {}
+            if pairs:
+                for method, chs in pairs.items():
+                    if method not in rec["methods"]:
+                        rec["methods"].append(method)
+                    rec["channels"].update(chs)
+            else:
+                rec["channels"].update(m.get("channels") or inc.get("channels") or [])
+    return out
+
+
+def _merchant_label(rec: dict) -> str:
+    """'Имя', 'Имя 📥' (ограничен только один канал), 'Имя (InstaPay)' (методы EGP)."""
+    label = escape_md(rec["name"])
+    if rec["methods"]:
+        label += f" ({escape_md(', '.join(rec['methods']))})"
+    chans = normalize_channels(rec["channels"])
+    if len(chans) == 1:
+        label += f" {channel_icons(chans)}"
+    return label
+
+
+def _cut_names(items: list) -> str:
+    shown = ", ".join(items[:GEO_LIST_LIMIT])
+    return shown + (f" и ещё {len(items) - GEO_LIST_LIMIT}" if len(items) > GEO_LIST_LIMIT else "")
+
+
+def _traffic_counts(merch: dict):
+    recs = list(merch.values())
+    return (sum(1 for r in recs if r["traffic"] is True),
+            sum(1 for r in recs if r["traffic"] is False),
+            sum(1 for r in recs if r["traffic"] is None))
+
+
+def build_incidents_overview(data: dict):
+    """Главный экран: одна строка на валюту + отдельные строки для сбоев на площадке. None - просадок нет."""
+    active = data.get("active_incidents", [])
+    if not active:
+        return None
+    chats = data.get("chats", {})
+    geos, outages = group_active_incidents(active)
+
+    text = "🔴 **Активные просадки:**\n\n"
+    buttons = []
+    for cur in sorted(geos, key=lambda c: geos[c][0]["id"]):
+        incs = geos[cur]
+        merch = geo_merchants(incs, chats)
+        stop, nostop, unknown = _traffic_counts(merch)
+        parts = [f"**{len(merch)}** мерч."]
+        if stop:
+            parts.append(f"🛑 {stop}")
+        if nostop:
+            parts.append(f"⚠️ {nostop}")
+        if unknown:
+            parts.append(f"❔ {unknown}")
+        parts.append(f"оповещений: {len(incs)}")
+        since = short_since(min((i.get("created_at") for i in incs if i.get("created_at")), default=None))
+        if since:
+            parts.append(f"с {since}")
+        icons = channel_icons(set().union(*[set(active_channels(i)) for i in incs]))
+        icons_part = f" {icons}" if icons else ""
+        text += f"• **{escape_md(cur)}**{icons_part} — " + " · ".join(parts) + "\n"
+        buttons.append([InlineKeyboardButton(text=f"🔍 {cur} · {len(merch)} мерч.", callback_data=f"geo_{cur}")])
+
+    for inc in outages:
+        label = inc.get("label") or "Сбой на площадке"
+        icons = channel_icons(active_channels(inc))
+        icons_part = f"{icons} " if icons else ""
+        text += (f"• `id {inc['id']}` 🛠 {icons_part}**{escape_md(incident_currency_label(inc))}** ({escape_md(label)}) — "
+                 f"активна в {len(inc.get('messages', []))} чат(ах)\n")
+        buttons.append([
+            InlineKeyboardButton(text=f"🔍 Подробнее id {inc['id']}", callback_data=f"incdetails_{inc['id']}"),
+            InlineKeyboardButton(text=f"🗑 Удалить id {inc['id']}", callback_data=f"silentremove_{inc['id']}")
+        ])
+
+    text += "\n🛑 - просили остановить трафик · ⚠️ - без остановки · ❔ - свой текст, неизвестно"
+    if geos:
+        text += "\nНажмите на валюту, чтобы увидеть, кто в просадке."
+    return text, InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def build_geo_summary(cur: str, incs: list, chats: dict, outages: list = None) -> str:
+    """Сводка по валюте: кто в просадке (с остановкой трафика / без), и кого по этой валюте не оповещали."""
+    merch = geo_merchants(incs, chats)
+    # мерчанты, которых по этой валюте оповестили через "Сбой на площадке"
+    outage_names = {}
+    for o in (outages or []):
+        for m in o.get("messages", []):
+            if cur in (m.get("pairs") or {}):
+                key = str(m.get("chat_key", m.get("chat_id")))
+                outage_names[key] = m.get("name") or chats.get(key, {}).get("name", key)
+    stop, nostop, unknown = _traffic_counts(merch)
+    since = short_since(min((i.get("created_at") for i in incs if i.get("created_at")), default=None))
+    head = f"В просадке: **{len(merch)}** мерч. · оповещений: **{len(incs)}**" + (f" · с {since}" if since else "")
+    lines = [f"🔍 **{escape_md(cur)} - сводка**", "", head, ""]
+
+    def names(flag):
+        return sorted((_merchant_label(r) for r in merch.values() if r["traffic"] is flag), key=str.casefold)
+
+    if stop:
+        lines.append(f"🛑 **Просили остановить трафик ({stop}):** {_cut_names(names(True))}")
+    if nostop:
+        lines.append(f"⚠️ **Без остановки трафика ({nostop}):** {_cut_names(names(False))}")
+    if unknown:
+        lines.append(f"❔ **Свой текст, неизвестно ({unknown}):** {_cut_names(names(None))}")
+
+    if outage_names:
+        lines.append(f"🛠 **Затронуты сбоем на площадке ({len(outage_names)}):** "
+                     + _cut_names(sorted((escape_md(n) for n in outage_names.values()), key=str.casefold)))
+
+    silent = sorted((escape_md(info.get("name", k)) for k, info in chats.items()
+                     if cur in info.get("currencies", []) and info.get("is_active", True)
+                     and k not in merch and k not in outage_names), key=str.casefold)
+    if silent:
+        lines.append(f"⚪ **Не оповещены по {escape_md(cur)} ({len(silent)}):** {_cut_names(silent)}")
+    elif any(cur in info.get("currencies", []) for info in chats.values()):
+        lines.append(f"✅ Все мерчанты по {escape_md(cur)} оповещены")
+    lines.append("")
+    lines.append("Подробности и удаление отдельных оповещений - кнопка «Оповещения».")
+    return "\n".join(lines)
+
+
+def build_geo_alerts(cur: str, incs: list):
+    """Подэкран: список оповещений валюты с кнопками 'Подробнее' / 'Удалить'."""
+    shown = incs[-45:]  # у Telegram лимит кнопок на сообщение
+    lines = [f"📋 **{escape_md(cur)} - оповещения ({len(incs)})**", ""]
+    buttons = []
+    for inc in shown:
+        ts = incident_traffic_stopped(inc)
+        mark = {True: "🛑", False: "⚠️", None: "❔"}[ts]
+        icons = channel_icons(active_channels(inc))
+        since = short_since(inc.get("created_at"))
+        label = inc.get("label") or inc.get("provider") or "без названия"
+        lines.append(f"• `id {inc['id']}` {mark} {icons + ' ' if icons else ''}{escape_md(label)} - {len(inc.get('messages', []))} чат(ах)"
+                     + (f" · {since}" if since else ""))
+        buttons.append([
+            InlineKeyboardButton(text=f"🔍 id {inc['id']}", callback_data=f"incdetails_{inc['id']}"),
+            InlineKeyboardButton(text=f"🗑 id {inc['id']}", callback_data=f"silentremove_{inc['id']}")
+        ])
+    if len(incs) > len(shown):
+        lines.append(f"\n(показаны последние {len(shown)})")
+    buttons.append([InlineKeyboardButton(text="⬅️ К сводке", callback_data=f"geo_{cur}"),
+                    InlineKeyboardButton(text="⬅️ К списку", callback_data="geoback")])
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+async def _show_screen(callback: types.CallbackQuery, text: str, kb):
+    """Меняет текущее окно на новый экран (без нового сообщения); если не вышло - присылает новым."""
+    for kwargs in ({"parse_mode": "Markdown"}, {}):
+        try:
+            return await callback.message.edit_text(text, reply_markup=kb, **kwargs)
+        except Exception:
+            continue
+    await callback.message.answer(text, reply_markup=kb)
+
+
 @dp.message(F.text == "📊 Показать имеющиеся просадки", F.chat.type == "private")
 async def show_incidents(message: types.Message):
     if not is_authorized(message.from_user.id):
         return await message.answer("🛑 Введите пароль через /start")
 
-    data = load_data()
-    active = data.get("active_incidents", [])
-
-    if not active:
+    view = build_incidents_overview(load_data())
+    if not view:
         return await message.answer("🟢 **Все системы работают штатно.** Активных просадок нет.", parse_mode="Markdown")
 
-    text = "🔴 **Активные просадки в данный момент:**\n\n"
-    for inc in active:
-        msg_count = len(inc.get("messages", []))
-        label = inc.get("label") or inc.get("provider") or "без названия"
-        icons = channel_icons(active_channels(inc))
-        icons_part = f"{icons} " if icons else ""
-        text += f"• `id {inc['id']}` {icons_part}**{escape_md(incident_currency_label(inc))}** ({escape_md(label)}) — активна в {msg_count} чат(ах)\n"
-
-    buttons = []
-    for inc in active:
-        label = inc.get("label") or inc.get("provider") or "без названия"
-        buttons.append([
-            InlineKeyboardButton(text=f"🔍 Подробнее id {inc['id']}", callback_data=f"incdetails_{inc['id']}"),
-            InlineKeyboardButton(text=f"🗑 Удалить id {inc['id']}", callback_data=f"silentremove_{inc['id']}")
-        ])
-    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
-
+    text, kb = view
     await message.answer(text, reply_markup=kb, parse_mode="Markdown")
+
+
+@dp.callback_query(F.data == "geoback")
+async def geo_back(callback: types.CallbackQuery):
+    if not is_authorized(callback.from_user.id):
+        return await callback.answer("🛑 Нет доступа", show_alert=True)
+    view = build_incidents_overview(load_data())
+    await callback.answer()
+    if not view:
+        return await _show_screen(callback, "🟢 **Все системы работают штатно.** Активных просадок нет.", None)
+    await _show_screen(callback, *view)
+
+
+@dp.callback_query(F.data.startswith("geo_"))
+async def show_geo_summary(callback: types.CallbackQuery):
+    if not is_authorized(callback.from_user.id):
+        return await callback.answer("🛑 Нет доступа", show_alert=True)
+    cur = callback.data[len("geo_"):]
+    data = load_data()
+    geos, outages = group_active_incidents(data.get("active_incidents", []))
+    incs = geos.get(cur)
+    if not incs:
+        return await callback.answer("Уже закрыта или не найдена", show_alert=True)
+    await callback.answer()
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"📋 Оповещения ({len(incs)})", callback_data=f"geoalerts_{cur}")],
+        [InlineKeyboardButton(text="⬅️ К списку", callback_data="geoback")]
+    ])
+    await _show_screen(callback, build_geo_summary(cur, incs, data.get("chats", {}), outages), kb)
+
+
+@dp.callback_query(F.data.startswith("geoalerts_"))
+async def show_geo_alerts(callback: types.CallbackQuery):
+    if not is_authorized(callback.from_user.id):
+        return await callback.answer("🛑 Нет доступа", show_alert=True)
+    cur = callback.data[len("geoalerts_"):]
+    geos, _ = group_active_incidents(load_data().get("active_incidents", []))
+    incs = geos.get(cur)
+    if not incs:
+        return await callback.answer("Уже закрыта или не найдена", show_alert=True)
+    await callback.answer()
+    await _show_screen(callback, *build_geo_alerts(cur, incs))
 
 
 @dp.callback_query(F.data.startswith("incdetails_"))
