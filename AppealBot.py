@@ -583,8 +583,72 @@ def build_incident_details(incident: dict, chats_registry: dict) -> str:
     return details
 
 
+_DASHES = dict.fromkeys(map(ord, "\u2010\u2011\u2012\u2013\u2014\u2015\u2212\ufe63\uff0d"), "-")
+_INVISIBLE = dict.fromkeys(map(ord, "\u200b\u200c\u200d\u2060\ufeff\u00ad"), None)
+
+
+def clean_cmd_text(text: str) -> str:
+    """Чинит то, что ломается при копировании команд из мессенджеров и заметок: длинное тире/«умный» минус вместо дефиса
+    (из-за него /add_chat падал с «Ошибка формата»), невидимые символы, неразрывные пробелы."""
+    return (text or "").translate(_DASHES).translate(_INVISIBLE).replace("\u00a0", " ")
+
+
+# ------------------- ПОЛИТИКА ВРЕМЕНИ: ТОЛЬКО UTC -------------------
+# Мерчантам нельзя писать время по МСК и другим поясам - работаем только в UTC. Фильтр стоит на всех местах, где оператор
+# вписывает текст сам (свой текст RU/EN, провайдер, сбой на площадке, правка старых сообщений).
+TIME_POLICY_ALLOW_UTC_TIMES = True  # True: время в тексте можно, если указано, что оно в UTC. False: любое время запрещено
+TIME_POLICY_REMINDER = "⏰ Время - только в UTC. МСК и любые другие часовые пояса бот не пропустит."
+
+_TZ_PATTERNS = [re.compile(x, re.I) for x in (
+    r"(?<![а-яёa-z])мск(?![а-яёa-z])", r"(?<![a-z])msk(?![a-z])",
+    r"по\s+москв\w*", r"моск\w*\s+врем\w*", r"moscow\s+(?:time|tz)", r"по\s+moscow",
+    r"по\s+(?:киев\w*|минск\w*|ташкент\w*|баку|каир\w*|стамбул\w*|дубаю|алмат\w*|астан\w*|бишкек\w*|тбилис\w*|ереван\w*)",
+    r"(?:киев|минск|ташкент|баку|каир|стамбул|дубай|алма-?ат|бишкек)\w*\s+врем\w*",
+    r"(?<![a-z])(?:eet|eest|cet|cest|ist|pkt|gst|trt|msd|gmt)(?![a-z])",
+    r"по\s+местн\w*\s+врем\w*", r"local\s+time",
+)]
+_TIME_PATTERNS = [re.compile(x, re.I) for x in (
+    r"(?<!\d)(?:[01]?\d|2[0-3]):[0-5]\d(?!\d)",
+    r"(?<![а-яёa-z])с\s*\d{1,2}(?::\d{2})?\s*до\s*\d{1,2}(?::\d{2})?(?!\s*(?:мин|сек|дн|нед|мес))",
+    r"(?<![а-яёa-z])с\s*\d{1,2}\s*[-\u2013\u2014]\s*\d{1,2}(?!\d)(?!\s*(?:мин|сек|дн|нед|мес))",
+    r"(?<![а-яёa-z])(?:в|до|после|около|к|с)\s*\d{1,2}\s*(?:час\w*|утра|вечера|ночи|дня)(?![а-яёa-z])",
+    r"(?<![a-z])(?:from|until|till|at)\s+\d{1,2}(?::\d{2})?\s*(?:am|pm|h|hrs?|to\s+\d{1,2})(?![a-z])",
+    r"(?<!\d)\d{1,2}\s*(?:am|pm)(?![a-z])",
+)]
+
+
+def time_policy_violation(text: str):
+    """None - текст допустим. Иначе (вид, найденный фрагмент): 'zone' - указан не-UTC часовой пояс,
+    'time' - указано время без UTC (или любое время, если TIME_POLICY_ALLOW_UTC_TIMES = False)."""
+    t = clean_cmd_text(text or "")
+    low = t.lower()
+    for pat in _TZ_PATTERNS:
+        m = pat.search(low)
+        if m:
+            return ("zone", t[m.start():m.end()])
+    has_utc = re.search(r"(?<![a-z])utc(?![a-z])", low) is not None
+    for pat in _TIME_PATTERNS:
+        m = pat.search(low)
+        if m and (not has_utc or not TIME_POLICY_ALLOW_UTC_TIMES):
+            return ("time", t[m.start():m.end()])
+    return None
+
+
+def time_policy_message(violation) -> str:
+    kind, frag = violation
+    if kind == "zone":
+        return (f"⛔ Текст не принят: указан часовой пояс, отличный от UTC (найдено: «{frag}»).\n"
+                "У нас время указывается только в UTC. Уберите время или запишите его в UTC (например «05:00–12:00 UTC») "
+                "и отправьте текст ещё раз.")
+    if not TIME_POLICY_ALLOW_UTC_TIMES:
+        return f"⛔ Текст не принят: в нём указано время (найдено: «{frag}»). Время в оповещениях указывать нельзя - уберите его и отправьте текст ещё раз."
+    return (f"⛔ Текст не принят: в нём есть время (найдено: «{frag}»), но не указано, что оно в UTC.\n"
+            "Допишите UTC (например «с 05:00 до 12:00 UTC») или уберите время и отправьте текст ещё раз.")
+
+
 def parse_chat_id(raw_id: str):
     """Разбирает ID вида '-10044442718018_1' на chat_id (-10044442718018) и thread_id (1)"""
+    raw_id = clean_cmd_text(raw_id).strip()
     if "_" in raw_id:
         parts = raw_id.split("_")
         return int(parts[0]), int(parts[1])
@@ -761,6 +825,17 @@ async def clean_keyboard(message: types.Message):
         pass
 
 
+# команды-ответы в группах (run_reply_fix ниже) должны стоять ДО общего catch_chat_id, иначе он забирает любое сообщение
+@dp.message(Command("edit_here"), F.chat.type.in_({"group", "supergroup"}))
+async def cmd_edit_here(message: types.Message):
+    await run_reply_fix(message, "edit")
+
+
+@dp.message(Command("delete_here"), F.chat.type.in_({"group", "supergroup"}))
+async def cmd_delete_here(message: types.Message):
+    await run_reply_fix(message, "delete")
+
+
 @dp.message(F.chat.type != "private")
 async def catch_chat_id(message: types.Message):
     thread_suffix = f"_{message.message_thread_id}" if message.message_thread_id else ""
@@ -805,13 +880,21 @@ async def cmd_add_chat(message: types.Message):
         return await message.answer("🛑 Введите пароль через /start")
 
     try:
-        raw_args = message.text.split()[1:]
+        raw_args = clean_cmd_text(message.text).split()[1:]
 
         if len(raw_args) < 2:
-            raise ValueError("Недостаточно аргументов")
+            raise ValueError("Недостаточно аргументов: нужны chat_id и валюты")
 
         chat_key = raw_args[0].strip()
-        chat_id, thread_id = parse_chat_id(chat_key)
+        try:
+            chat_id, thread_id = parse_chat_id(chat_key)
+        except ValueError:
+            return await message.answer(
+                f"⚠️ Не понял chat_id: `{chat_key}`\n"
+                "Это должно быть число вида `-1001234567890` (для чата с веткой `-1001234567890_1`): минус и цифры без пробелов и букв. "
+                "Если копировали команду из другого места, введите chat_id с клавиатуры.",
+                parse_mode="Markdown"
+            )
         currencies = [c.strip().upper() for c in raw_args[1].split(",") if c.strip()]
 
         bad_codes = [c for c in currencies if not CURRENCY_RE.fullmatch(c)]
@@ -874,9 +957,10 @@ async def cmd_add_chat(message: types.Message):
                 "Мерчант получал бы сообщения дважды - удалите лишнюю запись командой /del_chat."
             )
         await message.answer(answer_text, parse_mode="Markdown")
-    except Exception:
+    except Exception as e:
         await message.answer(
-            "⚠️ **Ошибка формата.**\nИспользуйте: `/add_chat <chat_id> <валюты> <RU/EN> <Имя_мерча> [теги]`\n"
+            "⚠️ **Ошибка формата.**" + (f"\nПричина: {escape_md(str(e)[:120])}" if str(e) else "") +
+            "\nИспользуйте: `/add_chat <chat_id> <валюты> <RU/EN> <Имя_мерча> [теги]`\n"
             "*Обычный чат:* `/add_chat -1005459446650 KGS,UZS RU PINCO @alex`\n"
             "*Чат с веткой:* `/add_chat -10044442718018_1 KGS,UZS RU PINCO @alex`",
             parse_mode="Markdown"
@@ -888,7 +972,7 @@ async def cmd_bulk_add_chats(message: types.Message):
     if not is_authorized(message.from_user.id):
         return await message.answer("🛑 Введите пароль через /start")
 
-    raw_text = message.text.split(maxsplit=1)
+    raw_text = clean_cmd_text(message.text).split(maxsplit=1)
     if len(raw_text) < 2:
         return await message.answer(
             "⚠️ **Формат массового импорта:**\n\n"
@@ -1154,6 +1238,155 @@ async def cmd_force_resolve(message: types.Message):
 
 
 # ------------------- УДАЛЕНИЕ ОШИБОЧНО ОТПРАВЛЕННОГО ОПОВЕЩЕНИЯ ВО ВСЕХ ЧАТАХ -------------------
+MSG_LINK_RE = re.compile(r"(?:https?://)?t\.me/(c/)?([A-Za-z0-9_]+)/(?:\d+/)?(\d+)")
+STALE_TEXT = "ℹ️ Сообщение неактуально."
+
+
+def parse_message_targets(text: str):
+    """Разбирает список сообщений для правки/удаления. Строка - ссылка на сообщение (t.me/c/123/456, t.me/name/456)
+    или 'chat_id message_id'. Строка 'Текст: ...' задаёт новый текст. Возвращает (цели, текст, нераспознанные строки)."""
+    targets, bad, new_text = [], [], None
+    lines = (text or "").split("\n")
+    first = lines[0].split(None, 1)
+    lines[0] = first[1] if len(first) > 1 else ""  # убираем саму команду
+    for raw in lines:
+        line = raw.strip()
+        if not line:
+            continue
+        if line.lower().startswith("текст:"):
+            new_text = line.split(":", 1)[1].strip()
+            continue
+        m = MSG_LINK_RE.search(line)
+        if m:
+            internal, who, mid = m.groups()
+            target = (int("-100" + who) if internal else "@" + who, int(mid))
+        else:
+            parts = line.split()
+            if len(parts) == 2 and re.fullmatch(r"-?\d+", parts[0]) and parts[1].isdigit():
+                target = (int(parts[0]), int(parts[1]))
+            else:
+                bad.append(line)
+                continue
+        if target not in targets:
+            targets.append(target)
+    return targets, new_text, bad
+
+
+async def run_message_fix(message: types.Message, action: str):
+    """Правка или удаление старых сообщений бота по ссылке / chat_id + message_id (для закрытых оповещений, у которых
+    в базе уже нет записи). Правка работает и на старых сообщениях, удаление - только младше 48 часов (ограничение Telegram)."""
+    if not is_authorized(message.from_user.id):
+        return await message.answer("🛑 Введите пароль через /start")
+    targets, new_text, bad = parse_message_targets(message.text)
+    cmd = "/edit_message" if action == "edit" else "/delete_message"
+    if not targets:
+        extra = "\nТекст: ℹ️ Сообщение неактуально." if action == "edit" else ""
+        note = ("Заменит текст сообщения бота (по умолчанию «" + STALE_TEXT + "»). Работает и на старых сообщениях."
+                if action == "edit" else
+                "Удалит сообщение бота. Telegram позволяет удалять только сообщения младше 48 часов.")
+        return await message.answer(
+            f"⚠️ Формат (по одному сообщению в строке):\n{cmd}\nhttps://t.me/c/1234567890/456\n-1001234567890 457{extra}\n\n"
+            "Ссылку на сообщение берите так: правый клик (или долгое нажатие) на сообщение → «Копировать ссылку».\n"
+            "Если ссылку скопировать нельзя: в самом чате ответьте на сообщение бота командой /edit_here (или /delete_here).\n"
+            + note)
+    if len(targets) > 100:
+        return await message.answer("⚠️ За раз можно не больше 100 сообщений.")
+    if action == "edit":
+        new_text = (new_text or STALE_TEXT)[:4000]
+        v = time_policy_violation(new_text)
+        if v:
+            return await message.answer(time_policy_message(v))
+    data = load_data()
+
+    def chat_name(cid):
+        for v in data.get("chats", {}).values():
+            if str(v.get("chat_id")) == str(cid):
+                return v.get("name") or str(cid)
+        return str(cid)
+
+    ok, failed = [], []
+    for cid, mid in targets:
+        label = f"{chat_name(cid)} (сообщение {mid})"
+        try:
+            if action == "edit":
+                await bot.edit_message_text(text=new_text, chat_id=cid, message_id=mid, parse_mode=None)
+            else:
+                await bot.delete_message(chat_id=cid, message_id=mid)
+            ok.append(label)
+        except Exception as e:
+            if "not modified" in str(e).lower():
+                ok.append(label + " - уже с этим текстом")
+            else:
+                log_error(f"[{action}_message] {cid}/{mid}: {e}")
+                failed.append(f"• {label}: {str(e)[:140]}")
+        await asyncio.sleep(0.05)
+
+    verb = "Изменено" if action == "edit" else "Удалено"
+    out = f"{verb}: {len(ok)} из {len(targets)}"
+    if ok:
+        out += "\n" + "\n".join("✅ " + x for x in ok[:40]) + (f"\n… и ещё {len(ok) - 40}" if len(ok) > 40 else "")
+    if failed:
+        out += "\n\n❌ Не получилось:\n" + "\n".join(failed[:40])
+    if bad:
+        out += "\n\n❔ Не распознал строки:\n" + "\n".join("• " + b[:100] for b in bad[:10])
+    for i in range(0, len(out), 3500):
+        await message.answer(out[i:i + 3500])
+
+
+async def run_reply_fix(message: types.Message, action: str):
+    """Команда-ответ на старое сообщение бота прямо в чате: правит/удаляет именно его. Нужна, когда ссылку на сообщение
+    скопировать нельзя (обычные группы без ссылок). Работает только у авторизованных операторов, в чате ничего не пишет -
+    результат приходит оператору в личку."""
+    if not message.from_user or not is_authorized(message.from_user.id):
+        return
+    uid = message.from_user.id
+    target = message.reply_to_message
+    if target is None or target.from_user is None or target.from_user.id != bot.id:
+        try:
+            await bot.send_message(uid, "⚠️ Команду нужно отправить ОТВЕТОМ на сообщение бота в чате.")
+        except Exception:
+            pass
+        return
+    args = (message.text or "").split(None, 1)
+    title = message.chat.title or str(message.chat.id)
+    try:
+        if action == "edit":
+            text = ((args[1].strip() if len(args) > 1 else "") or STALE_TEXT)[:4000]
+            v = time_policy_violation(text)
+            if v:
+                await bot.send_message(uid, time_policy_message(v))
+                return
+            await bot.edit_message_text(text=text, chat_id=message.chat.id, message_id=target.message_id, parse_mode=None)
+            result = f"✅ Изменено в чате «{title}» (сообщение {target.message_id})"
+        else:
+            await bot.delete_message(chat_id=message.chat.id, message_id=target.message_id)
+            result = f"✅ Удалено в чате «{title}» (сообщение {target.message_id})"
+    except Exception as e:
+        if action == "edit" and "not modified" in str(e).lower():
+            result = f"✅ В чате «{title}» уже этот текст (сообщение {target.message_id})"
+        else:
+            log_error(f"[{action}_here] {message.chat.id}/{target.message_id}: {e}")
+            result = f"❌ Чат «{title}», сообщение {target.message_id}: {str(e)[:140]}"
+    try:
+        await bot.delete_message(chat_id=message.chat.id, message_id=message.message_id)  # свою команду убираем, если есть права
+    except Exception:
+        result += "\nВашу команду в чате можно удалить самому: «Удалить для всех»."
+    try:
+        await bot.send_message(uid, result)
+    except Exception:
+        pass
+
+
+@dp.message(Command("edit_message"), F.chat.type == "private")
+async def cmd_edit_message(message: types.Message):
+    await run_message_fix(message, "edit")
+
+
+@dp.message(Command("delete_message"), F.chat.type == "private")
+async def cmd_delete_message(message: types.Message):
+    await run_message_fix(message, "delete")
+
+
 @dp.message(Command("delete_alert"), F.chat.type == "private")
 async def cmd_delete_alert(message: types.Message):
     """Удаляет сообщения инцидента из всех чатов, куда они были отправлены (по chat_id + message_id,
@@ -1379,6 +1612,10 @@ async def process_provider(message: types.Message, state: FSMContext):
             reply_markup=main_keyboard()
         )
 
+    v = time_policy_violation(message.text)
+    if v:
+        return await message.answer(time_policy_message(v), reply_markup=cancel_only_keyboard())
+
     provider = message.text.strip()
     await proceed_to_chat_selection(message, state, provider)
 
@@ -1481,7 +1718,7 @@ async def finish_channel_selection(callback: types.CallbackQuery, state: FSMCont
         await callback.answer()
         await callback.message.edit_text(
             "✏️ Введите текст на **русском** (уйдёт в чаты с языком RU, отправляется 1 в 1).\n"
-            "ℹ️ В свой текст ничего не подставляется автоматически (ни банк, ни каналы) - впишите нужное сами.",
+            "ℹ️ В свой текст ничего не подставляется автоматически (ни банк, ни каналы) - впишите нужное сами.\n" + TIME_POLICY_REMINDER,
             parse_mode="Markdown",
             reply_markup=cancel_only_keyboard()
         )
@@ -1513,6 +1750,10 @@ async def process_custom_text_ru(message: types.Message, state: FSMContext):
             reply_markup=main_keyboard()
         )
 
+    v = time_policy_violation(message.text)
+    if v:
+        return await message.answer(time_policy_message(v), reply_markup=cancel_only_keyboard())
+
     await state.update_data(custom_text_ru=message.text)
     user_data = await state.get_data()
 
@@ -1538,7 +1779,7 @@ async def process_custom_text_ru(message: types.Message, state: FSMContext):
 
     await state.set_state(IncidentState.waiting_for_custom_text_en)
     await message.answer(
-        "✏️ Теперь введите текст на **английском** (уйдёт в чаты с языком EN, отправляется 1 в 1):",
+        "✏️ Теперь введите текст на **английском** (уйдёт в чаты с языком EN, отправляется 1 в 1):\n" + TIME_POLICY_REMINDER,
         parse_mode="Markdown",
         reply_markup=cancel_only_keyboard()
     )
@@ -1553,6 +1794,10 @@ async def process_custom_text_en(message: types.Message, state: FSMContext):
             "Если это была команда - отправьте её ещё раз, теперь она сработает.",
             reply_markup=main_keyboard()
         )
+
+    v = time_policy_violation(message.text)
+    if v:
+        return await message.answer(time_policy_message(v), reply_markup=cancel_only_keyboard())
 
     user_data = await state.get_data()
     await send_alert(
@@ -2952,7 +3197,7 @@ async def outage_type_custom(callback: types.CallbackQuery, state: FSMContext):
     await callback.answer()
     await callback.message.edit_text(
         "✏️ Введите текст на **русском** (уйдёт в чаты с языком RU, отправляется 1 в 1).\n"
-        "ℹ️ В свой текст ничего не подставляется автоматически (ни валюты, ни каналы) - впишите нужное сами.",
+        "ℹ️ В свой текст ничего не подставляется автоматически (ни валюты, ни каналы) - впишите нужное сами.\n" + TIME_POLICY_REMINDER,
         parse_mode="Markdown",
         reply_markup=cancel_only_keyboard()
     )
@@ -2967,6 +3212,10 @@ async def outage_custom_ru(message: types.Message, state: FSMContext):
             "Если это была команда - отправьте её ещё раз, теперь она сработает.",
             reply_markup=main_keyboard()
         )
+
+    v = time_policy_violation(message.text)
+    if v:
+        return await message.answer(time_policy_message(v), reply_markup=cancel_only_keyboard())
     await state.update_data(out_custom_ru=message.text)
     d = await state.get_data()
     target = d["out_target_chats"]
@@ -2976,7 +3225,7 @@ async def outage_custom_ru(message: types.Message, state: FSMContext):
         return await outage_show_confirmation(message.answer, state)
     await state.set_state(OutageState.waiting_for_custom_en)
     await message.answer(
-        "✏️ Теперь введите текст на **английском** (уйдёт в чаты с языком EN, отправляется 1 в 1):",
+        "✏️ Теперь введите текст на **английском** (уйдёт в чаты с языком EN, отправляется 1 в 1):\n" + TIME_POLICY_REMINDER,
         parse_mode="Markdown",
         reply_markup=cancel_only_keyboard()
     )
@@ -2991,6 +3240,10 @@ async def outage_custom_en(message: types.Message, state: FSMContext):
             "Если это была команда - отправьте её ещё раз, теперь она сработает.",
             reply_markup=main_keyboard()
         )
+
+    v = time_policy_violation(message.text)
+    if v:
+        return await message.answer(time_policy_message(v), reply_markup=cancel_only_keyboard())
     await state.update_data(out_custom_en=message.text)
     await outage_show_confirmation(message.answer, state)
 
