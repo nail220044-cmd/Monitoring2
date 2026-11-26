@@ -12,7 +12,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeybo
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.exceptions import TelegramRetryAfter, TelegramAPIError
+from aiogram.exceptions import TelegramRetryAfter, TelegramAPIError, TelegramBadRequest
 
 # ------------------- ЗАГРУЗКА ПЕРЕМЕННЫХ ОКРУЖЕНИЯ -------------------
 load_dotenv()
@@ -138,16 +138,16 @@ CHANNEL_PHRASES["EN"]["nom"] = {
 # {unaffected} (фраза про незатронутый канал), {restored}/{remaining_on} (для восстановления).
 TEMPLATES = {
     "std": {
-        "RU": "⚠️ **[{curr}]{provider_part}** Коллеги, на стороне банка наблюдаются технические трудности {affecting}, из-за чего могут происходить отмены и задержки платежей. На нашей стороне всё работает штатно, трафик приостанавливать не требуется. Мы сообщим вам о восстановлении.",
-        "EN": "⚠️ **[{curr}]{provider_part}** Colleagues, technical issues are currently observed on the bank's side {affecting}, which may cause failed transactions and delays. Systems on our side are operating normally; traffic does not need to be stopped. We'll let you know once restored."
+        "RU": "⚠️ **[{curr}]{provider_part}** Коллеги, на стороне банка наблюдаются технические трудности {affecting}. Часть платежей может завершаться отменой или проходить с задержкой. Наши системы работают штатно, поэтому останавливать трафик не нужно. Мы следим за ситуацией и сообщим вам о восстановлении.",
+        "EN": "⚠️ **[{curr}]{provider_part}** Colleagues, technical issues are observed on the bank's side {affecting}. Some payments may be cancelled or delayed. Our systems are operating normally, so there is no need to stop traffic. We are monitoring the situation and will notify you once it is restored."
     },
     "stop": {
         "RU": "⚠️ **[{curr}]{provider_part}** Коллеги, на стороне банка ведутся технические работы {affecting}, в связи с чем могут быть отмены и снижение конверсии.\n🛑 **Просим временно остановить трафик {channels_on}.**{unaffected}\nМы сообщим вам о восстановлении.",
         "EN": "⚠️ **[{curr}]{provider_part}** Colleagues, technical maintenance is undergoing on the bank's side {affecting}, which may result in higher failure rates and lower conversion.\n🛑 **Please temporarily stop processing traffic {channels_on}.**{unaffected}\nWe will let you know once restored."
     },
     "short_std": {
-        "RU": "⚠️ **[{curr}]{provider_part}** Коллеги, в данный момент наблюдаются временные технические трудности {affecting}, из-за чего возможны отмены и задержки платежей. Трафик приостанавливать не требуется. О восстановлении сообщим дополнительно.",
-        "EN": "⚠️ **[{curr}]{provider_part}** Colleagues, we are currently experiencing temporary technical issues {affecting}, which may cause failed transactions and delays. Traffic does not need to be paused. We will notify you once resolved."
+        "RU": "⚠️ **[{curr}]{provider_part}** Коллеги, в данный момент наблюдаются временные технические трудности {affecting}. Часть платежей может отменяться или проходить с задержкой. Останавливать трафик не нужно. О восстановлении сообщим дополнительно.",
+        "EN": "⚠️ **[{curr}]{provider_part}** Colleagues, we are currently experiencing temporary technical issues {affecting}. Some payments may be cancelled or delayed. There is no need to pause traffic. We will notify you once it is resolved."
     },
     "short_stop": {
         "RU": "⚠️ **[{curr}]{provider_part}** Коллеги, в данный момент наблюдаются временные технические трудности {affecting}, в связи с чем возможны отмены платежей и снижение конверсии.\n🛑 **Просим временно приостановить трафик {channels_on}.**{unaffected}\nО восстановлении сообщим дополнительно.",
@@ -233,6 +233,20 @@ def authorize_user(user_id: int):
     if user_id not in data["authorized_users"]:
         data["authorized_users"].append(user_id)
         save_data(data)
+
+
+async def answer_safe(message: types.Message, text: str, **kwargs):
+    """Markdown-ответ с запасным вариантом: если Telegram не смог разобрать разметку (одинокое подчёркивание и т.п.),
+    отправляем тот же текст без форматирования, чтобы сообщение точно дошло, а не маскировалось под «Ошибку формата»."""
+    kwargs.setdefault("parse_mode", "Markdown")
+    try:
+        return await message.answer(text, **kwargs)
+    except TelegramBadRequest as e:
+        if "parse entities" not in str(e).lower():
+            raise
+        log_error(f"[markdown fallback] {str(e)[:140]}")
+        kwargs.pop("parse_mode", None)
+        return await message.answer(text.replace("`", "").replace("**", "").replace("\\", ""), **kwargs)
 
 
 def escape_md(text: str) -> str:
@@ -686,6 +700,7 @@ class IncidentState(StatesGroup):
     selecting_channels = State()
     waiting_for_custom_text_ru = State()
     waiting_for_custom_text_en = State()
+    waiting_for_custom_stop = State()
 
 
 class ResolveState(StatesGroup):
@@ -949,14 +964,14 @@ async def cmd_add_chat(message: types.Message):
         if new_currencies:
             answer_text += (
                 f"\n\n🆕 Новая валюта: **{', '.join(new_currencies)}** — кнопка появится автоматически. "
-                "Если это опечатка, отправьте /add_chat для этого чата ещё раз с верным кодом."
+                "Если это опечатка, отправьте `/add_chat` для этого чата ещё раз с верным кодом."
             )
         if dup_keys:
             answer_text += (
                 f"\n\n⚠️ Этот чат уже записан под другим ключом: {', '.join('`' + k + '`' for k in dup_keys)}. "
-                "Мерчант получал бы сообщения дважды - удалите лишнюю запись командой /del_chat."
+                "Мерчант получал бы сообщения дважды - удалите лишнюю запись командой `/del_chat`."
             )
-        await message.answer(answer_text, parse_mode="Markdown")
+        await answer_safe(message, answer_text)
     except Exception as e:
         await message.answer(
             "⚠️ **Ошибка формата.**" + (f"\nПричина: {escape_md(str(e)[:120])}" if str(e) else "") +
@@ -1122,10 +1137,10 @@ async def cmd_list_chats(message: types.Message):
         text += "\n⚠️ **Дубли: один и тот же чат записан несколько раз (мерчант получает сообщения по нескольку раз):**\n"
         for keys in dups:
             text += "• " + ", ".join(f"`{k}`" for k in keys) + "\n"
-        text += "Лишнюю запись удалите командой /del_chat с её ключом.\n"
+        text += "Лишнюю запись удалите командой `/del_chat` с её ключом.\n"
 
     for chunk_start in range(0, len(text), 3500):
-        await message.answer(text[chunk_start:chunk_start + 3500], parse_mode="Markdown")
+        await answer_safe(message, text[chunk_start:chunk_start + 3500])
 
 
 # ------------------- ДИАГНОСТИКА: ПРОВЕРИТЬ ДОСТУПНОСТЬ ЧАТОВ -------------------
@@ -1385,6 +1400,28 @@ async def cmd_edit_message(message: types.Message):
 @dp.message(Command("delete_message"), F.chat.type == "private")
 async def cmd_delete_message(message: types.Message):
     await run_message_fix(message, "delete")
+
+
+@dp.message(Command("set_stop"), F.chat.type == "private")
+async def cmd_set_stop(message: types.Message):
+    """/set_stop <id> да|нет - вручную отметить, просили ли по оповещению остановить трафик (для оповещений со своим текстом)."""
+    if not is_authorized(message.from_user.id):
+        return await message.answer("🛑 Введите пароль через /start")
+    parts = (message.text or "").split()
+    yes, no = {"да", "yes", "y", "1", "стоп"}, {"нет", "no", "n", "0"}
+    if len(parts) != 3 or not parts[1].isdigit() or parts[2].lower() not in (yes | no):
+        return await message.answer(
+            "⚠️ Формат: /set_stop <id оповещения> да|нет\n"
+            "Пример: /set_stop 171 нет - по оповещению 171 трафик остановить НЕ просили.\n"
+            "id оповещения виден в списке просадок и в «Подробнее».")
+    inc_id, val = int(parts[1]), parts[2].lower() in yes
+    data = load_data()
+    inc = next((i for i in data.get("active_incidents", []) if i["id"] == inc_id), None)
+    if not inc:
+        return await message.answer(f"⚠️ Активное оповещение id {inc_id} не найдено.")
+    inc["traffic_stopped"] = val
+    save_data(data)
+    await message.answer(f"✅ Оповещение id {inc_id}: " + ("просили остановить трафик." if val else "трафик остановить НЕ просили."))
 
 
 @dp.message(Command("delete_alert"), F.chat.type == "private")
@@ -1763,19 +1800,8 @@ async def process_custom_text_ru(message: types.Message, state: FSMContext):
 
     if not has_en_chat:
         # среди выбранных чатов нет ни одного EN — не отвлекаем вторым вопросом
-        await send_alert(
-            target_msg=message,
-            currency=user_data["selected_currency"],
-            provider=user_data["provider"],
-            label=user_data["label"],
-            target_chats=target_chats,
-            selected_chat_ids=selected_chat_ids,
-            custom_texts={"RU": message.text, "EN": message.text},
-            channels=user_data.get("channels", []),
-            methods=user_data.get("methods", [])
-        )
-        await state.clear()
-        return
+        await state.update_data(custom_text_en=message.text)
+        return await ask_custom_stop(message, state)
 
     await state.set_state(IncidentState.waiting_for_custom_text_en)
     await message.answer(
@@ -1799,19 +1825,71 @@ async def process_custom_text_en(message: types.Message, state: FSMContext):
     if v:
         return await message.answer(time_policy_message(v), reply_markup=cancel_only_keyboard())
 
-    user_data = await state.get_data()
-    await send_alert(
-        target_msg=message,
-        currency=user_data["selected_currency"],
-        provider=user_data["provider"],
-        label=user_data["label"],
-        target_chats=user_data["target_chats"],
-        selected_chat_ids=user_data["selected_chat_ids"],
-        custom_texts={"RU": user_data["custom_text_ru"], "EN": message.text},
-        channels=user_data.get("channels", []),
-        methods=user_data.get("methods", [])
-    )
+    await state.update_data(custom_text_en=message.text)
+    await ask_custom_stop(message, state)
+
+
+@dp.errors()
+async def on_handler_error(event: types.ErrorEvent):
+    """Любая ошибка внутри обработчика: пишем в errors.log и не оставляем оператора с «зависшей» кнопкой.
+    Типичный случай - устаревшее окно: диалог уже завершён другим нажатием, а по старой кнопке нажали ещё раз."""
+    exc = event.exception
+    log_error(f"[handler error] {type(exc).__name__}: {str(exc)[:300]}")
+    cq = event.update.callback_query if event.update else None
+    if cq is not None:
+        try:
+            await cq.answer("⚠️ Это окно устарело или уже обработано. Начните действие заново из меню.", show_alert=True)
+        except Exception:
+            pass
+    return True
+
+
+@dp.message(IncidentState.waiting_for_custom_stop)
+async def custom_stop_waiting_text(message: types.Message, state: FSMContext):
+    """Пока бот ждёт ответ «просите остановить трафик?», текст не отправляется - напоминаем про кнопки."""
+    if is_reserved_input(message.text):
+        await state.clear()
+        return await message.answer("⚠️ Отправка своего текста отменена. Нажмите нужную кнопку меню ещё раз.", reply_markup=main_keyboard())
+    await message.answer("👆 Текст уже принят. Ответьте кнопкой выше: просите ли вы мерчантов остановить трафик? "
+                         "Ничего не отправится, пока вы не выберете ответ.")
+
+
+async def ask_custom_stop(message: types.Message, state: FSMContext):
+    """Для своего текста бот не знает, просили ли вы остановить трафик, - спрашиваем один раз перед отправкой.
+    Ответ сохраняется в просадке: от него зависит блок «НЕ просили остановить» в сводке и текст при восстановлении."""
+    await state.set_state(IncidentState.waiting_for_custom_stop)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🛑 Да, просим остановить трафик", callback_data="cstop_yes")],
+        [InlineKeyboardButton(text="📣 Нет, только информируем", callback_data="cstop_no")],
+        cancel_button_row()
+    ])
+    await message.answer(
+        "Вы просите мерчантов приостановить трафик этим оповещением?\n"
+        "Ответ попадёт в сводку (кого стопнули, а кого нет) и в текст при восстановлении.",
+        reply_markup=kb)
+
+
+@dp.callback_query(IncidentState.waiting_for_custom_stop, F.data.in_({"cstop_yes", "cstop_no"}))
+async def custom_stop_chosen(callback: types.CallbackQuery, state: FSMContext):
+    d = await state.get_data()
+    if "custom_text_ru" not in d:  # быстрый двойной тап: первое нажатие уже запустило отправку
+        return await callback.answer("Уже отправляется")
     await state.clear()
+    await callback.answer()
+    ru = d["custom_text_ru"]
+    await send_alert(
+        target_msg=callback.message,
+        currency=d["selected_currency"],
+        provider=d["provider"],
+        label=d["label"],
+        target_chats=d["target_chats"],
+        selected_chat_ids=[str(x) for x in d["selected_chat_ids"]],
+        custom_texts={"RU": ru, "EN": d.get("custom_text_en") or ru},
+        channels=d.get("channels", []),
+        methods=d.get("methods", []),
+        traffic_stopped=(callback.data == "cstop_yes"),
+        edit_target=True
+    )
 
 
 async def safe_send(chat_id, thread_id, text, reply_to_message_id=None, retries=2):
@@ -1873,7 +1951,7 @@ async def send_alert(*args, edit_target: bool = False, **kwargs):
 
 async def _send_alert(target_msg: types.Message, currency: str, provider: str, label: str, target_chats: dict, selected_chat_ids: list,
                      template_key: str = None, custom_texts: dict = None, channels: list = None, methods: list = None,
-                     progress_msg=None, fingerprint: str = None):
+                     progress_msg=None, fingerprint: str = None, traffic_stopped: bool = None):
     data = load_data()
     channels = normalize_channels(channels)
     methods = normalize_methods(methods, currency)
@@ -1958,7 +2036,7 @@ async def _send_alert(target_msg: types.Message, currency: str, provider: str, l
             "currency": currency,
             "method": ", ".join(methods),
             "methods": methods,
-            "traffic_stopped": None if custom_texts else (template_key in ("stop", "short_stop")),
+            "traffic_stopped": traffic_stopped if traffic_stopped is not None else (None if custom_texts else (template_key in ("stop", "short_stop"))),
             "fingerprint": fingerprint,
             "provider": provider,
             "label": label,
@@ -2879,7 +2957,7 @@ def alert_fingerprint(kw: dict) -> str:
         "alert", kw.get("currency"), kw.get("label") or kw.get("provider"), kw.get("provider"),
         kw.get("template_key") or "custom", sorted(normalize_channels(kw.get("channels"))),
         sorted(kw.get("methods") or []), sorted(str(x) for x in (kw.get("selected_chat_ids") or [])),
-        ct.get("RU"), ct.get("EN"))
+        ct.get("RU"), ct.get("EN"), kw.get("traffic_stopped"))
 
 
 def outage_fingerprint(d: dict) -> str:
@@ -3176,10 +3254,12 @@ async def outage_channels_both(callback: types.CallbackQuery, state: FSMContext)
 async def outage_show_confirmation(answer_fn, state: FSMContext):
     d = await state.get_data()
     await state.set_state(OutageState.confirming)
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ ОТПРАВИТЬ ВСЕМ", callback_data="outsend")],
-        cancel_button_row()
-    ])
+    if d.get("out_type") == "custom":
+        rows = [[InlineKeyboardButton(text="🛑 ОТПРАВИТЬ ВСЕМ: просим остановить трафик", callback_data="outsend_stop")],
+                [InlineKeyboardButton(text="📣 ОТПРАВИТЬ ВСЕМ: только информируем (без стопа)", callback_data="outsend_info")]]
+    else:
+        rows = [[InlineKeyboardButton(text="✅ ОТПРАВИТЬ ВСЕМ", callback_data="outsend")]]
+    kb = InlineKeyboardMarkup(inline_keyboard=rows + [cancel_button_row()])
     await answer_fn(build_outage_confirmation(d), reply_markup=kb, parse_mode="Markdown")
 
 
@@ -3335,7 +3415,7 @@ async def _send_outage(target_msg: types.Message, d: dict, progress_msg=None, fi
             "id": incident_id,
             "kind": "outage",
             "fingerprint": fingerprint,
-            "traffic_stopped": None if custom_texts else True,
+            "traffic_stopped": d.get("out_traffic") if custom_texts else True,
             "currency": ", ".join(currencies),
             "currencies": currencies,
             "provider": "",
@@ -3362,9 +3442,13 @@ async def _send_outage(target_msg: types.Message, d: dict, progress_msg=None, fi
     await send_report(target_msg, progress_msg, report)
 
 
-@dp.callback_query(OutageState.confirming, F.data == "outsend")
+@dp.callback_query(OutageState.confirming, F.data.in_({"outsend", "outsend_stop", "outsend_info"}))
 async def outage_send(callback: types.CallbackQuery, state: FSMContext):
     d = await state.get_data()
+    if not d.get("out_selected_chat_ids"):  # быстрый двойной тап: первое нажатие уже запустило отправку
+        return await callback.answer("Уже отправляется")
+    if callback.data in ("outsend_stop", "outsend_info"):
+        d["out_traffic"] = callback.data == "outsend_stop"
     await state.clear()
     await callback.answer()
     try:
@@ -3765,6 +3849,41 @@ def _traffic_counts(merch: dict):
             sum(1 for r in recs if r["traffic"] is None))
 
 
+def outages_for_currency(cur: str, outages: list) -> list:
+    """Сбои на площадке, которые затрагивают эту валюту."""
+    return [o for o in (outages or []) if any(cur in (m.get("pairs") or {}) for m in o.get("messages", []))]
+
+
+def outage_merchants_for(cur: str, outages: list, chats: dict) -> dict:
+    """Мерчанты, которых по валюте оповестили через «Сбой на площадке»: {chat_key: {name, traffic}}."""
+    out = {}
+    for o in outages or []:
+        traffic = incident_traffic_stopped(o)
+        for m in o.get("messages", []):
+            if cur in (m.get("pairs") or {}):
+                key = str(m.get("chat_key", m.get("chat_id")))
+                name = m.get("name") or chats.get(key, {}).get("name", key)
+                if key in out:
+                    out[key]["traffic"] = _merge_traffic(out[key]["traffic"], traffic)
+                else:
+                    out[key] = {"name": name, "traffic": traffic}
+    return out
+
+
+def geo_all_merchants(cur: str, incs: list, outages: list, chats: dict) -> dict:
+    """Все затронутые мерчанты валюты: из обычных оповещений и из сбоя на площадке. 'src' - откуда мерчант."""
+    merch = geo_merchants(incs, chats)
+    for r in merch.values():
+        r["src"] = {"plain"}
+    for key, rec in outage_merchants_for(cur, outages, chats).items():
+        if key in merch:
+            merch[key]["traffic"] = _merge_traffic(merch[key]["traffic"], rec["traffic"])
+            merch[key]["src"].add("outage")
+        else:
+            merch[key] = {"name": rec["name"], "traffic": rec["traffic"], "channels": set(), "methods": [], "src": {"outage"}}
+    return merch
+
+
 def build_incidents_overview(data: dict):
     """Главный экран: одна строка на валюту + отдельные строки для сбоев на площадке. None - просадок нет."""
     active = data.get("active_incidents", [])
@@ -3777,7 +3896,8 @@ def build_incidents_overview(data: dict):
     buttons = []
     for cur in sorted(geos, key=lambda c: geos[c][0]["id"]):
         incs = geos[cur]
-        merch = geo_merchants(incs, chats)
+        outs = outages_for_currency(cur, outages)
+        merch = geo_all_merchants(cur, incs, outs, chats)
         stop, nostop, unknown = _traffic_counts(merch)
         parts = [f"**{len(merch)}** мерч."]
         if stop:
@@ -3786,8 +3906,8 @@ def build_incidents_overview(data: dict):
             parts.append(f"⚠️ {nostop}")
         if unknown:
             parts.append(f"❔ {unknown}")
-        parts.append(f"оповещений: {len(incs)}")
-        since = short_since(min((i.get("created_at") for i in incs if i.get("created_at")), default=None))
+        parts.append(f"оповещений: {len(incs) + len(outs)}")
+        since = short_since(min((i.get("created_at") for i in list(incs) + outs if i.get("created_at")), default=None))
         if since:
             parts.append(f"с {since}")
         icons = channel_icons(set().union(*[set(active_channels(i)) for i in incs]))
@@ -3806,49 +3926,45 @@ def build_incidents_overview(data: dict):
             InlineKeyboardButton(text=f"🗑 Удалить id {inc['id']}", callback_data=f"silentremove_{inc['id']}")
         ])
 
-    text += "\n🛑 - просили остановить трафик · ⚠️ - без остановки · ❔ - свой текст, неизвестно"
+    text += "\n🛑 - просили остановить трафик · ⚠️ - НЕ просили · ❔ - свой текст, стоп не отмечен"
     if geos:
-        text += "\nНажмите на валюту, чтобы увидеть, кто в просадке."
+        text += "\nНажмите на валюту, чтобы увидеть, кто в просадке и кого не стопнули."
     return text, InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
 def build_geo_summary(cur: str, incs: list, chats: dict, outages: list = None) -> str:
-    """Сводка по валюте: кто в просадке (с остановкой трафика / без), и кого по этой валюте не оповещали."""
-    merch = geo_merchants(incs, chats)
-    # мерчанты, которых по этой валюте оповестили через "Сбой на площадке"
-    outage_names = {}
-    for o in (outages or []):
-        for m in o.get("messages", []):
-            if cur in (m.get("pairs") or {}):
-                key = str(m.get("chat_key", m.get("chat_id")))
-                outage_names[key] = m.get("name") or chats.get(key, {}).get("name", key)
+    """Сводка по валюте: кого просили остановить трафик, кого НЕ просили, у кого стоп не отмечен, кого не оповещали."""
+    outs = outages_for_currency(cur, outages)
+    merch = geo_all_merchants(cur, incs, outs, chats)
     stop, nostop, unknown = _traffic_counts(merch)
-    since = short_since(min((i.get("created_at") for i in incs if i.get("created_at")), default=None))
-    head = f"В просадке: **{len(merch)}** мерч. · оповещений: **{len(incs)}**" + (f" · с {since}" if since else "")
+    since = short_since(min((i.get("created_at") for i in list(incs) + outs if i.get("created_at")), default=None))
+    head = f"Затронуто: **{len(merch)}** мерч. · оповещений: **{len(incs) + len(outs)}**" + (f" · с {since}" if since else "")
     lines = [f"🔍 **{escape_md(cur)} - сводка**", "", head, ""]
 
     def names(flag):
-        return sorted((_merchant_label(r) for r in merch.values() if r["traffic"] is flag), key=str.casefold)
+        return sorted((_merchant_label(r) + (" 🛠" if r["src"] == {"outage"} else "")
+                       for r in merch.values() if r["traffic"] is flag), key=str.casefold)
 
     if stop:
         lines.append(f"🛑 **Просили остановить трафик ({stop}):** {_cut_names(names(True))}")
     if nostop:
-        lines.append(f"⚠️ **Без остановки трафика ({nostop}):** {_cut_names(names(False))}")
+        lines.append(f"⚠️ **НЕ просили остановить трафик ({nostop}):** {_cut_names(names(False))}")
     if unknown:
-        lines.append(f"❔ **Свой текст, неизвестно ({unknown}):** {_cut_names(names(None))}")
-
-    if outage_names:
-        lines.append(f"🛠 **Затронуты сбоем на площадке ({len(outage_names)}):** "
-                     + _cut_names(sorted((escape_md(n) for n in outage_names.values()), key=str.casefold)))
+        lines.append(f"❔ **Свой текст, стоп не отмечен ({unknown}):** {_cut_names(names(None))}")
 
     silent = sorted((escape_md(info.get("name", k)) for k, info in chats.items()
                      if cur in info.get("currencies", []) and info.get("is_active", True)
-                     and k not in merch and k not in outage_names), key=str.casefold)
+                     and k not in merch), key=str.casefold)
     if silent:
         lines.append(f"⚪ **Не оповещены по {escape_md(cur)} ({len(silent)}):** {_cut_names(silent)}")
     elif any(cur in info.get("currencies", []) for info in chats.values()):
         lines.append(f"✅ Все мерчанты по {escape_md(cur)} оповещены")
     lines.append("")
+    if any(r["src"] == {"outage"} for r in merch.values()):
+        lines.append("🛠 - оповещён только через «Сбой на площадке»")
+    unk_ids = sorted({i["id"] for i in list(incs) + outs if incident_traffic_stopped(i) is None})
+    if unknown and unk_ids:
+        lines.append("Отметить вручную: " + ", ".join(f"`/set_stop {i} да|нет`" for i in unk_ids))
     lines.append("Подробности и удаление отдельных оповещений - кнопка «Оповещения».")
     return "\n".join(lines)
 
@@ -3994,6 +4110,17 @@ async def silent_remove_incident(callback: types.CallbackQuery):
 
 
 # ------------------- ЗАПУСК -------------------
+# ------------------- КНОПКИ ИЗ УСТАРЕВШИХ ОКОН -------------------
+# Регистрируется ПОСЛЕДНИМ: ловит только нажатия, которые не подошли ни одному сценарию (окно уже закрыто,
+# диалог завершён другим нажатием, бот перезапускался). Без этого у оператора просто «крутится» кнопка.
+@dp.callback_query()
+async def stale_button(callback: types.CallbackQuery):
+    try:
+        await callback.answer("⚠️ Это окно устарело или уже обработано. Начните действие заново из меню.", show_alert=True)
+    except Exception:
+        pass
+
+
 async def main():
     await bot.delete_webhook(drop_pending_updates=True)
     print("Старые обновления сброшены. Бот готов к работе!")
